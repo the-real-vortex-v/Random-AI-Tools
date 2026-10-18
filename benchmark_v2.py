@@ -2,14 +2,19 @@ import os
 import sys
 import json
 import time
+import random
+import tarfile
+import gzip
+import bz2
 import argparse
 import subprocess
 import configparser
 import lmstudio as lms
 
-# Global Default Template (Used if lazarus_bench.ini does not exist)
 DEFAULT_INI_CONTENT = """[Benchmark Settings]
 test_prompt = Write a comprehensive, thread-safe matrix multiplication unit in Object Pascal for Lazarus.
+context_target_fill = 0.90
+source_text_directory = ./benchmark_corpus.tar.gz
 min_gpu_ratio = 0.0
 max_gpu_ratio = 1.0
 min_context = 2048
@@ -18,35 +23,155 @@ context_step = 2048
 """
 
 def load_or_create_ini():
-    """Natively reads options from lazarus_bench.ini across all file architectures."""
+    """Natively reads configuration structures from local ini allocations."""
     ini_path = "lazarus_bench.ini"
     config = configparser.ConfigParser()
-    
     if not os.path.exists(ini_path):
         with open(ini_path, "w", encoding="utf-8") as f:
             f.write(DEFAULT_INI_CONTENT)
-        print(f"[INI] Configuration file missing. Created baseline framework template at: {ini_path}")
-        
+        print(f"[INI] Configuration file missing. Created fresh default at: {ini_path}")
     config.read(ini_path, encoding="utf-8")
     return config["Benchmark Settings"]
 
-# Extract persistent background parameters from the INI file
 ini_settings = load_or_create_ini()
-TEST_PROMPT = ini_settings.get("test_prompt")
+SOURCE_PATH = ini_settings.get("source_text_directory", "./benchmark_corpus")
+
+def extract_text_from_archive(path):
+    """Extracts raw text content natively from directories, tarballs, gz, bz2, and 7z containers."""
+    corpus_chunks = []
+    
+    if os.path.isdir(path):
+        files = [os.path.join(path, f) for f in os.listdir(path) if f.endswith('.txt')]
+        random.shuffle(files)
+        for file_path in files:
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    corpus_chunks.append(f.read())
+            except Exception:
+                pass
+        return "\n".join(corpus_chunks)
+
+    path_lower = path.lower()
+    
+    # 1. Native Tar/Tar.Gz/Tar.Bz2/Tgz/Tbz handling
+    if tarfile.is_tarfile(path) or any(path_lower.endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz']):
+        try:
+            with tarfile.open(path, "r:*") as tar:
+                members = [m for m in tar.getmembers() if m.isfile() and m.name.lower().endswith('.txt')]
+                random.shuffle(members)
+                for member in members:
+                    f = tar.extractfile(member)
+                    if f:
+                        corpus_chunks.append(f.read().decode("utf-8", errors="ignore"))
+        except Exception as e:
+            print(f"[ARCHIVE ERROR] Tar extraction failure: {e}")
+
+    # 2. Native Single Gzip File handling
+    elif path_lower.endswith('.gz'):
+        try:
+            with gzip.open(path, 'rt', encoding='utf-8', errors='ignore') as f:
+                corpus_chunks.append(f.read())
+        except Exception as e:
+            print(f"[ARCHIVE ERROR] Gzip extraction failure: {e}")
+
+    # 3. Native Single Bzip2 File handling
+    elif path_lower.endswith('.bz2'):
+        try:
+            with bz2.open(path, 'rt', encoding='utf-8', errors='ignore') as f:
+                corpus_chunks.append(f.read())
+        except Exception as e:
+            print(f"[ARCHIVE ERROR] Bzip2 extraction failure: {e}")
+
+    # 4. Cross-Platform 7-Zip Handling (using system binary to bypass pip dependency requirements)
+    elif path_lower.endswith('.7z'):
+        try:
+            use_shell = True if os.name == 'nt' else False
+            binary = "7z" if os.name == 'nt' else "7za"
+            list_cmd = [binary, "l", path]
+            res = subprocess.run(list_cmd, capture_output=True, text=True, shell=use_shell)
+            if res.returncode == 0:
+                extract_cmd = [binary, "x", path, "-so", "*.txt"]
+                res_ext = subprocess.run(extract_cmd, capture_output=True, text=True, shell=use_shell, errors='ignore')
+                if res_ext.returncode == 0:
+                    corpus_chunks.append(res_ext.stdout)
+        except Exception as e:
+            print(f"[ARCHIVE ERROR] 7-Zip process extraction layout stalled: {e}")
+            
+    return "\n".join(corpus_chunks)
+
+def gather_context_filler(target_token_count, model_instance):
+    """Loads text from source container and slices it to match the precise token threshold configuration."""
+    corpus_text = extract_text_from_archive(SOURCE_PATH)
+    
+    if not corpus_text or len(corpus_text.strip()) == 0:
+        return "Standard baseline processing fallback text block. Please configure lazarus_bench.ini source_text_directory correctly."
+        
+    tokens = model_instance.tokenize(corpus_text)
+    if len(tokens) > target_token_count:
+        return model_instance.detokenize(tokens[:target_token_count])
+    return corpus_text
+
+def probe_configuration(model_key, gpu_ratio, context_size, fill_ratio):
+    """Evaluates prompt processing times alongside standard generation throughput parameters."""
+    model_key = str(model_key).strip()
+    print(f"  [PROBE] Staging -> GPU Ratio: {gpu_ratio:.2f} | Window: {context_size} | Fill: {fill_ratio*100:.0f}%")
+    
+    tps_metrics = {"prefill_time": -1.0, "prefill_speed": -1.0, "generation_speed": -1.0, "ttft": -1.0}
+    
+    try:
+        with lms.Client() as client:
+            model = client.llm.load_new_instance(
+                model_key, config={"contextLength": context_size, "gpu": {"ratio": gpu_ratio}}
+            )
+            time.sleep(2)
+            
+            allocated_fill_tokens = int(context_size * fill_ratio) - 300
+            if allocated_fill_tokens < 100:
+                allocated_fill_tokens = 100
+                
+            context_data = gather_context_filler(allocated_fill_tokens, model)
+            task_prompt = ini_settings.get("test_prompt")
+            final_prompt = f"CONTEXT DATABASE:\n{context_data}\n\nTASK COMMAND:\n{task_prompt}"
+            
+            start_pipeline = time.perf_counter()
+            time_to_first_token = None
+            output_buffer = ""
+
+            stream = model.respond_stream(final_prompt, config={"temperature": 0.1})
+            for fragment in stream:
+                if time_to_first_token is None:
+                    time_to_first_token = time.perf_counter() - start_pipeline
+                output_buffer += fragment.content
+                
+            total_duration = time.perf_counter() - start_pipeline
+            generated_tokens = len(model.tokenize(output_buffer))
+            prompt_tokens = len(model.tokenize(final_prompt))
+            
+            tps_metrics["ttft"] = time_to_first_token if time_to_first_token else 0.0
+            tps_metrics["prefill_time"] = tps_metrics["ttft"]
+            tps_metrics["prefill_speed"] = prompt_tokens / tps_metrics["prefill_time"] if tps_metrics["prefill_time"] > 0 else 0
+            
+            gen_window = total_duration - tps_metrics["ttft"]
+            tps_metrics["generation_speed"] = generated_tokens / gen_window if gen_window > 0 else 0
+            
+            print(f"    -> Prefill Speed: {tps_metrics['prefill_speed']:.1f} t/s | Gen Speed: {tps_metrics['generation_speed']:.1f} t/s | TTFT: {tps_metrics['ttft']:.2f}s")
+            model.unload()
+            
+    except Exception as e:
+        print(f"    -> [CRASH/OOM] Execution error: {e}")
+        return None
+        
+    time.sleep(4)
+    return tps_metrics
 
 def get_installed_models():
     """Queries the lms CLI dynamically across Windows, macOS, Linux, and BSD environments."""
     models = []
-    # Avoid platform-locking 'cmd.exe /c' strings by targeting the binary directly
     cmd = ["lms", "ls", "--json"]
-    
-    # Check for shell requirement on Windows to maintain environment compatibility
     use_shell = True if os.name == 'nt' else False
-    
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, shell=use_shell, check=True)
         json_data = json.loads(result.stdout)
-        
         if isinstance(json_data, list):
             for item in json_data:
                 if "path" in item: models.append(str(item["path"]).strip())
@@ -56,169 +181,81 @@ def get_installed_models():
             for item in json_data["models"]:
                 if "path" in item: models.append(str(item["path"]).strip())
     except Exception:
-        # Fallback to standard line parsing if JSON payload execution hits a pipeline error
         try:
             result = subprocess.run(["lms", "ls"], capture_output=True, text=True, shell=use_shell)
             for line in result.stdout.splitlines():
                 clean_line = line.strip()
                 if clean_line and not any(clean_line.startswith(h) for h in ["NAME", "ID", "VERSION", "TYPE"]):
                     parts = clean_line.split()
-                    if parts: models.append(parts[0])
+                    if parts: models.append(parts)
         except Exception:
             pass
-
-    models = sorted(list(set([m for m in models if m])))
-    if not models:
-        return ["qwen2.5-coder-7b-instruct", "llama-3.1-8b-instruct"]
-    return models
-
-def generate_pascal_context(approx_tokens):
-    """Generates synthetic Object Pascal unit framework to tax the KV Cache."""
-    lines = ["unit ComplexMatrixMath;", "interface uses SysUtils, Classes, Math;", "implementation"]
-    for i in range(max(1, approx_tokens // 40)):
-        lines.append(f"procedure DummyNode{i}(var A: array of Double); begin end;")
-    lines.append("end.")
-    return "\n".join(lines)
-
-def probe_configuration(model_key, gpu_ratio, context_size):
-    """Natively initializes and benchmarks a specific hardware slice configuration via SDK."""
-    model_key = str(model_key).strip()
-    print(f"  [PROBE] Staging via SDK -> GPU Ratio: {gpu_ratio:.2f} | Context: {context_size} tokens")
-    
-    context_data = generate_pascal_context(context_size - 600)
-    final_prompt = f"CONTEXT:\n```pascal\n{context_data}\n```\n\nPROMPT:\n{TEST_PROMPT}"
-    tps = -1.0
-    
-    try:
-        with lms.Client() as client:
-            model = client.llm.load_new_instance(
-                model_key,
-                config={
-                    "contextLength": context_size,
-                    "gpu": {"ratio": gpu_ratio}
-                }
-            )
-            time.sleep(2)
-            
-            start_time = time.perf_counter()
-            time_to_first_token = None
-            output_buffer = ""
-
-            stream = model.respond_stream(final_prompt, config={"temperature": 0.1})
-            for fragment in stream:
-                if time_to_first_token is None:
-                    time_to_first_token = time.perf_counter() - start_time
-                output_buffer += fragment.content
-                
-            total_duration = time.perf_counter() - start_time
-            total_tokens = len(model.tokenize(output_buffer))
-            
-            gen_window = total_duration - time_to_first_token if time_to_first_token else 0
-            tps = total_tokens / gen_window if gen_window > 0 else 0
-            print(f"    -> [SUCCESS] Generation complete: {tps:.2f} tokens/sec")
-            model.unload()
-            
-    except Exception as e:
-        print(f"    -> [CRASH] Hardware slice layout failed or hit an OOM barrier: {e}")
-        tps = -1.0
-        
-    time.sleep(4)
-    return tps
+    return sorted(list(set([m for m in models if m])))
 
 def parse_cli_arguments():
-    """Initializes command line parameter bindings mapping out the runtime help dashboard."""
-    parser = argparse.ArgumentParser(
-        description="LM Studio Cross-Platform Hardware Suite Profiler for Lazarus IDE Codespaces.",
-        formatter_class=argparse.RawTextHelpFormatter,
-        epilog="""HELP SECTION & USAGE INFORMATION:
-================================================================================
-This script automates resource monitoring across Windows, Mac, Linux, and BSD.
-It steps through GPU hardware offloading ratios to isolate computing layout layouts.
-
-Runtime Configurations:
-  1. Default Settings: Extracted directly from lazarus_bench.ini if parameters are ignored.
-  2. Grid Search Run:  Pass --test-all-gpu to sweep linearly from minimum to maximum bounds.
-  3. Binary Search:    Omit --test-all-gpu to locate optimum balance layers efficiently.
-
-Key Testing Execution Examples:
-  python benchmark.py --test-all-gpu --min-context 4096
-  python benchmark.py --test-all-context --min-context 2048 --max-context 8192 --context-step 2048
-================================================================================"""
-    )
-    parser.add_argument("--test-all-gpu", action="store_true", help="Sweep GPU ratios linearly step by step (Grid Sweep mode).")
-    parser.add_argument("--test-all-context", action="store_true", help="Forces iterative context window sweeps across boundaries.")
-    parser.add_argument("--min-gpu-ratio", type=float, default=float(ini_settings.get("min_gpu_ratio", 0.0)), help="Minimum bound GPU decimal offload scale fraction.")
-    parser.add_argument("--max-gpu-ratio", type=float, default=float(ini_settings.get("max_gpu_ratio", 1.0)), help="Maximum boundary GPU hardware split offload value.")
+    parser = argparse.ArgumentParser(description="Cross-Platform Context Suite & Containerized Prompt Latency Profiler.")
+    parser.add_argument("--test-all-gpu", action="store_true", help="Sweep GPU ratios linearly.")
+    parser.add_argument("--test-all-context", action="store_true", help="Forces iterative context sweeps.")
+    parser.add_argument("--context-fill-override", type=float, default=None, help="Override target context window fill value.")
+    parser.add_argument("--min-gpu-ratio", type=float, default=float(ini_settings.get("min_gpu_ratio", 0.0)))
+    parser.add_argument("--max-gpu-ratio", type=float, default=float(ini_settings.get("max_gpu_ratio", 1.0)))
     parser.add_argument("--min-context", type=int, default=int(ini_settings.get("min_context", 2048)))
     parser.add_argument("--max-context", type=int, default=int(ini_settings.get("max_context", 8192)))
     parser.add_argument("--context-step", type=int, default=int(ini_settings.get("context_step", 2048)))
     return parser.parse_args()
-
-def execute_binary_search_gpu(args, model_key, context_size, results_accumulator):
+def execute_binary_search_gpu(args, model_key, context_size, fill_ratio, results_accumulator):
     """Executes a binary search sweep targeting the optimal GPU offload decimal ratio."""
     low = int(args.min_gpu_ratio * 10)
     high = int(args.max_gpu_ratio * 10)
-    optimal_ratio_int = low
-    max_observed_speed = 0.0
     evaluation_cache = {}
 
     while low <= high:
         mid = (low + high) // 2
         gpu_ratio_val = mid / 10.0
-        
-        if mid in evaluation_cache: 
-            break
+        if mid in evaluation_cache: break
             
-        tps = probe_configuration(model_key, gpu_ratio_val, context_size)
-        evaluation_cache[mid] = tps
+        metrics = probe_configuration(model_key, gpu_ratio_val, context_size, fill_ratio)
+        evaluation_cache[mid] = metrics
         
-        results_accumulator.append({
-            "context": context_size, "gpu_ratio": gpu_ratio_val, 
-            "tps": tps, "status": "OOM/CRASH" if tps == -1.0 else "SUCCESS"
-        })
-        
-        if tps == -1.0:
+        if metrics is None:
+            results_accumulator.append({"context": context_size, "gpu_ratio": gpu_ratio_val, "gen_speed": -1.0, "ttft": -1.0, "status": "OOM/CRASH"})
             high = mid - 1
             continue
             
-        if tps > max_observed_speed:
-            max_observed_speed = tps
-            optimal_ratio_int = mid
-            
+        results_accumulator.append({"context": context_size, "gpu_ratio": gpu_ratio_val, "gen_speed": metrics["generation_speed"], "ttft": metrics["ttft"], "status": "SUCCESS"})
+        
         prev_step = mid - 1
         if prev_step >= int(args.min_gpu_ratio * 10) and prev_step not in evaluation_cache:
             prev_ratio = prev_step / 10.0
-            prev_tps = probe_configuration(model_key, prev_ratio, context_size)
-            evaluation_cache[prev_step] = prev_tps
-            results_accumulator.append({
-                "context": context_size, "gpu_ratio": prev_ratio, 
-                "tps": prev_tps, "status": "OOM/CRASH" if prev_tps == -1.0 else "SUCCESS"
-            })
-        else:
-            prev_tps = evaluation_cache.get(mid - 1, 0.0)
+            prev_m = probe_configuration(model_key, prev_ratio, context_size, fill_ratio)
+            evaluation_cache[prev_step] = prev_m
+            if prev_m:
+                results_accumulator.append({"context": context_size, "gpu_ratio": prev_ratio, "gen_speed": prev_m["generation_speed"], "ttft": prev_m["ttft"], "status": "SUCCESS"})
+            else:
+                results_accumulator.append({"context": context_size, "gpu_ratio": prev_ratio, "gen_speed": -1.0, "ttft": -1.0, "status": "OOM/CRASH"})
+        
+        current_tps = metrics["generation_speed"]
+        prev_tps = evaluation_cache.get(mid - 1, None)
+        prev_tps_val = prev_tps["generation_speed"] if prev_tps else 0.0
 
-        if tps > prev_tps: 
-            low = mid + 1
-        else: 
-            high = mid - 1
+        if current_tps > prev_tps_val: low = mid + 1
+        else: high = mid - 1
 
 def generate_yaml_fallback(data_dict):
     yaml_lines = ["# Automated Lazarus AI Profile Configuration"]
     for key, val in data_dict.items():
         if isinstance(val, dict):
             yaml_lines.append(f"{key}:")
-            for sub_key, sub_val in val.items():
-                yaml_lines.append(f"  {sub_key}: {sub_val}")
-        else:
-            yaml_lines.append(f"{key}: {val}")
+            for sub_key, sub_val in val.items(): yaml_lines.append(f"  {sub_key}: {sub_val}")
+        else: yaml_lines.append(f"{key}: {val}")
     return "\n".join(yaml_lines)
+
 if __name__ == "__main__":
     args = parse_cli_arguments()
     
-    print(f"\n{'='*80}")
-    print("                   LOCAL LM STUDIO MODEL SELECTION")
-    print(f"{'='*80}")
+    target_fill = args.context_fill_override if args.context_fill_override else float(ini_settings.get("context_target_fill", 0.90))
     
+    print(f"\n{'='*80}\n                   LOCAL LM STUDIO MODEL SELECTION\n{'='*80}")
     models = get_installed_models()
     for index, model_name in enumerate(models, start=1):
         print(f"  [{index}] {model_name}")
@@ -231,93 +268,54 @@ if __name__ == "__main__":
             choice_idx = int(choice) - 1
             if 0 <= choice_idx < len(models):
                 selected_model = models[choice_idx]
-                print(f"\n[SELECTED] Target Model set to: {selected_model}")
                 break
-            else:
-                print(f"Invalid index. Please select a number between 1 and {len(models)}.")
-        except ValueError:
-            print("Please enter a valid integer number.")
+            else: print(f"Invalid index. Please select a number between 1 and {len(models)}.")
+        except ValueError: print("Please enter a valid integer number.")
             
     all_runs = []
-    if args.test_all_context:
-        context_space = list(range(args.min_context, args.max_context + 1, args.context_step))
-    else:
-        context_space = [args.min_context]
+    context_space = list(range(args.min_context, args.max_context + 1, args.context_step)) if args.test_all_context else [args.min_context]
     
-    print(f"\n{'#'*80}")
-    print(f"INITIALIZING PERFORMANCE EVALUATION MATRIX FOR: {selected_model}")
-    print(f"{'#'*80}")
+    print(f"\n{'#'*80}\nRUNNING CONTAINER STRESS EVALUATION ({target_fill*100:.0f}% Window Loading Mode)\n{'#'*80}")
+    print(f"[DATA TARGET] Extracting text datasets dynamically from: {SOURCE_PATH}")
     
     for context in context_space:
         if args.test_all_gpu:
-            print(f"\n--- GRID SWEEP CYCLE: Context Window Size = {context} Tokens ---")
             for r_int in range(int(args.min_gpu_ratio * 10), int(args.max_gpu_ratio * 10) + 1):
                 ratio = r_int / 10.0
-                tps = probe_configuration(selected_model, ratio, context)
-                
-                all_runs.append({
-                    "context": context, 
-                    "gpu_ratio": ratio, 
-                    "tps": tps, 
-                    "status": "OOM/CRASH" if tps == -1.0 else "SUCCESS"
-                })
+                m = probe_configuration(selected_model, ratio, context, target_fill)
+                if m:
+                    all_runs.append({"context": context, "gpu_ratio": ratio, "gen_speed": m["generation_speed"], "ttft": m["ttft"], "status": "SUCCESS"})
+                else:
+                    all_runs.append({"context": context, "gpu_ratio": ratio, "gen_speed": -1.0, "ttft": -1.0, "status": "OOM/CRASH"})
         else:
-            execute_binary_search_gpu(args, selected_model, context, all_runs)
+            execute_binary_search_gpu(args, selected_model, context, target_fill, all_runs)
 
-    successful_runs = [r for r in all_runs if r["tps"] > 0]
+    successful_runs = [r for r in all_runs if r["gen_speed"] > 0]
     if not successful_runs:
-        print(f"\n[ERROR] All tested layouts crashed or encountered an OOM status for {selected_model}.")
+        print("\n[ERROR] All hardware layout sweeps hit an out-of-memory or timeout boundary block.")
         sys.exit(1)
         
-    optimal_config = max(successful_runs, key=lambda x: x["tps"])
+    optimal_config = max(successful_runs, key=lambda x: x["gen_speed"])
 
-    print(f"\n{'='*80}")
-    print(f"                   EXPERIMENT RUN WORKSPACE REPORT ({selected_model})")
-    print(f"{'='*80}")
-    print(" Context Size   |  GPU Offload Ratio  |  Status    |  Speed (TPS)")
+    print(f"\n{'='*80}\n                   EXPERIMENT RUN WORKSPACE REPORT\n{'='*80}")
+    print(" Context Size   |  GPU Offload Ratio  |  Status    |  TTFT (s)  |  Gen Speed (TPS)")
     print("-" * 80)
     for r in all_runs:
-        speed_str = "N/A" if r["tps"] == -1.0 else f"{r['tps']:.2f}"
-        print(f" {r['context']:<14} | {r['gpu_ratio']:<19} | {r['status']:<10} | {speed_str}")
+        speed_str = "N/A" if r["gen_speed"] == -1.0 else f"{r['gen_speed']:.2f}"
+        ttft_str = "N/A" if r["ttft"] == -1.0 else f"{r['ttft']:.2f}s"
+        print(f" {r['context']:<14} | {r['gpu_ratio']:<19} | {r['status']:<10} | {ttft_str:<10} | {speed_str}")
     print("=" * 80)
     
-    print(f"\n>>> OPTIMAL SETTING SUGGESTIONS FOR LAZARUS WORKSPACE <<<")
-    print(f" -> Best Performance Achieved at Context: {optimal_config['context']} Tokens")
-    print(f" -> Optimal GPU Offload Ratio Variable:  {optimal_config['gpu_ratio']}")
-    print(f" -> Peak Generation Throughput Capacity:  {optimal_config['tps']:.2f} tokens/sec\n")
-
     export_data = {
         "model_identity": selected_model,
         "target_optimized_metrics": {
             "context_length": optimal_config["context"],
             "gpu_offload_ratio": optimal_config["gpu_ratio"],
-            "peak_tokens_per_second": round(optimal_config["tps"], 2)
+            "peak_tokens_per_second": round(optimal_config["gen_speed"], 2),
+            "expected_prompt_latency_ttft": f"{optimal_config['ttft']:.2f}s"
         }
     }
 
-    with open("lazarus_ai_profile.json", "w") as f:
-        json.dump(export_data, f, indent=2)
-    with open("lazarus_ai_profile.yaml", "w") as f:
-        f.write(generate_yaml_fallback(export_data))
-        
-    report_lines = [
-        "================================================================================",
-        "          LAZARUS IDE CODESPACE EXPERIMENTAL PERFORMANCE LOG REPORT",
-        "================================================================================",
-        f"Generated Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Evaluated Target Model: {selected_model}\n",
-        "SUMMARY RECOMMENDATION:",
-        "Based on extensive hardware performance mapping tests, the configuration below",
-        "yields the highest possible text generation throughput while preventing VRAM overflow.",
-        f"  * Recommended Context Buffer Allocation:  {optimal_config['context']} Tokens",
-        f"  * Recommended GPU Offload Ratio Variable: {optimal_config['gpu_ratio']}",
-        f"  * Anticipated Processing Efficiency:      {optimal_config['tps']:.2f} tokens/second\n",
-        "FULL METRIC LOG WINDOW MATRIX:"
-    ]
-    for r in all_runs:
-        speed_val = "FAILED/OOM" if r["tps"] == -1.0 else f"{r['tps']:.2f} tokens/sec"
-        report_lines.append(f"  - Context: {r['context']:<6} | GPU Ratio: {r['gpu_ratio']:<4} -> {speed_val}")
-        
-    with open("lazarus_ai_profile.txt", "w") as f:
-        f.write("\n".join(report_lines))
-    print("Success: Performance configurations saved to JSON, YAML, and text report logs.")
+    with open("lazarus_ai_profile.json", "w") as f: json.dump(export_data, f, indent=2)
+    with open("lazarus_ai_profile.yaml", "w") as f: f.write(generate_yaml_fallback(export_data))
+    print("Success: Automated matrix data configurations saved cleanly to the working environment.")
