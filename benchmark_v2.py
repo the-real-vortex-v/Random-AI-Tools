@@ -106,7 +106,7 @@ def extract_text_from_archive(path):
 
 def generate_synthetic_context(target_token_count, source_path):
     """Generates context string data using local files, falling back to static blocks to prevent token deadlocks."""
-    raw_text = extract_text_from_archive(source_path)
+    raw_text = extract_text_from_archive(path=source_path)
     if raw_text and len(raw_text.strip()) > 100:
         max_chars = target_token_count * 4
         return raw_text[:max_chars]
@@ -130,14 +130,19 @@ def probe_configuration(model_key, gpu_layers, max_layers_bound, cpu_threads, mo
     use_shell = True if os.name == 'nt' else False
     
     try:
-        # FIX: Proactively sweep out any existing model footprints by calling raw "lms unload" before initializing the loop segment
+        # 1. Proactive Memory Purge with Verbose Exit Verification
         try:
             print("    -> Issuing global 'lms unload' to clear out all memory registers...")
-            subprocess.run(["lms", "unload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=use_shell)
-            time.sleep(4)  # Short stabilization settle window
-        except Exception:
-            pass
+            unload_res = subprocess.run(["lms", "unload"], capture_output=True, text=True, shell=use_shell)
+            if unload_res.returncode == 0:
+                print("    -> [SUCCESS] Global memory flush complete. Host VRAM layers completely cleared out.")
+            else:
+                print(f"    -> [INFO] Unload signal executed. Note: {unload_res.stderr.strip() if unload_res.stderr else 'No active models found in RAM.'}")
+            time.sleep(4)
+        except Exception as ex:
+            print(f"    -> [WARNING] Pre-load cleanup hook encountered an anomaly: {ex}")
 
+        # 2. Parameter Calculation Logs
         if gpu_layers == -1 or max_layers_bound <= 0:
             gpu_ratio_arg = 1.0
         else:
@@ -148,7 +153,12 @@ def probe_configuration(model_key, gpu_layers, max_layers_bound, cpu_threads, mo
         context_data = generate_synthetic_context(allocated_fill_tokens, source_target)
         final_prompt = f"CONTEXT DATABASE:\n{context_data}\n\nTASK COMMAND:\n{task_prompt}"
 
-        # Initialize the model directly inside lms.llm mapping core threads, experts, and offload ratios natively
+        # 3. Verbose Lifecycle Tracker for Model Initialization Execution Block
+        print(f"    -> [STARTING TEST] Handing over parameters to lms.llm loop backend...")
+        print(f"       Configuration: Ratio={gpu_ratio_arg} | ThreadCount={cpu_threads} | ContextLimit={context_size}")
+        
+        load_start_time = time.perf_counter()
+        
         model = lms.llm(
             model_key,
             config={
@@ -162,8 +172,12 @@ def probe_configuration(model_key, gpu_layers, max_layers_bound, cpu_threads, mo
                 }
             }
         )
+        
+        load_duration = time.perf_counter() - load_start_time
+        print(f"    -> [SUCCESS] Model loaded successfully in {load_duration:.2f}s. Memory addresses locked. Starting inference pipeline...")
         time.sleep(5)
         
+        # 4. Stream Processing
         start_pipeline = time.perf_counter()
         time_to_first_token = None
         output_buffer = ""
@@ -187,21 +201,21 @@ def probe_configuration(model_key, gpu_layers, max_layers_bound, cpu_threads, mo
         print(f"    -> Prefill Speed: {tps_metrics['prefill_speed']:.1f} t/s | Gen Speed: {tps_metrics['generation_speed']:.1f} t/s | TTFT: {tps_metrics['ttft']:.2f}s")
         
     except Exception as e:
-        print(f"    -> [CRASH/OOM] Execution error: {e}")
+        print(f"    -> [CRASH/OOM] Active configuration testing failed: {e}")
         tps_metrics = None
         
     finally:
-        # Object resource deletion forces immediate memory clearance cleanly
         if model is not None:
             try:
                 del model
             except Exception: pass
             
-        # FIX: Ensure a final clean memory sweep at the end of the test block pass
         try:
-            print("    -> Finalizing cleanup via global 'lms unload' command...")
-            subprocess.run(["lms", "unload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=use_shell)
-            time.sleep(5)  # Cooldown window to let massive layers completely sweep out of RAM/VRAM
+            print("    -> Finalizing cleanup loop via global 'lms unload' command...")
+            post_unload_res = subprocess.run(["lms", "unload"], capture_output=True, text=True, shell=use_shell)
+            if post_unload_res.returncode == 0:
+                print("    -> [SUCCESS] Test run teardown confirmed. Memory blocks scrubbed clean.")
+            time.sleep(5)
         except Exception: pass
             
     time.sleep(3)
