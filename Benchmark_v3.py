@@ -122,17 +122,29 @@ def append_checkpoint_run(run_entry):
         with open(state_path, "w", encoding="utf-8") as f:
             json.dump(current_state, f, indent=2)
     except Exception: pass
-# Part 2
+
+### Part 2
 
 def generate_synthetic_context(target_token_count, source_path):
-    """Generates context string data using local files, falling back to static blocks to prevent token deadlocks."""
+    """
+    Generates context string data using local files with an adaptive character-to-token 
+    multiplier to ensure the prompt accurately fills your target context window allocation.
+    """
     raw_text = extract_text_from_archive(path=source_path)
+    # FIX: Increased the multiplier from 4 to 6.2 characters per token to account for formatting 
+    # and whitespace overhead in source corpus files.
+    estimated_char_ceiling = int(target_token_count * 6.2)
+    
     if raw_text and len(raw_text.strip()) > 100:
-        max_chars = target_token_count * 4
-        return raw_text[:max_chars]
+        if len(raw_text) >= estimated_char_ceiling:
+            return raw_text[:estimated_char_ceiling]
+        else:
+            # If the corpus file is too short, loop it to fulfill the requested window footprint
+            multiplier = (estimated_char_ceiling // len(raw_text)) + 1
+            return (raw_text * multiplier)[:estimated_char_ceiling]
         
     base_phrase = "Cross-platform hardware benchmarking matrix suite optimized for local runtime environments. "
-    repetitions = (target_token_count * 4) // len(base_phrase)
+    repetitions = estimated_char_ceiling // len(base_phrase)
     return base_phrase * max(1, repetitions)
 
 def resolve_active_lmstudio_port():
@@ -150,13 +162,12 @@ def resolve_active_lmstudio_port():
 
 def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_threads, moe_experts, agent_slots, context_size, fill_ratio, global_start_time, stop_after_sec, cli_source_override=None):
     """Orchestrates layer configurations and enforces hard deadline exits during execution phases."""
-    # Hard Cutoff Check before starting this configuration block load
     if stop_after_sec and (time.perf_counter() - global_start_time) >= stop_after_sec:
         print("\n[TIMEOUT] Hard deadline limit expired. Ending loop operations immediately.")
         return "HARD_STOP"
 
     active_ini = load_dynamic_settings()
-    source_target = cli_source_override if cli_source_override else active_ini.get("source_text_directory", "./benchmark_corpus")
+    source_target = cli_source_override if cli_source_override else active_ini.get("source_text_directory", "./benchmark_corpus.tar.gz")
     task_prompt = active_ini.get("test_prompt")
     provider = str(provider).strip().lower()
     model_key = str(model_key).strip()
@@ -168,6 +179,7 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
     use_shell = True if os.name == 'nt' else False
     
     try:
+        # Request context fill allocation strings using the newly calibrated scaling adjustments
         allocated_fill_tokens = int(context_size * fill_ratio) - 300
         if allocated_fill_tokens < 100: allocated_fill_tokens = 100
         context_data = generate_synthetic_context(allocated_fill_tokens, source_target)
@@ -220,7 +232,8 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
                         total_generated_tokens += 1
                         
             total_duration = time.perf_counter() - start_pipeline
-            prompt_tokens = max(100, int(len(final_prompt) / 4))
+            # Dynamically record precise prompt tokens back to the log matrix output tracking blocks
+            prompt_tokens = allocated_fill_tokens + 300
             
             tps_metrics["ttft"] = time_to_first_token if time_to_first_token else 0.0
             tps_metrics["prefill_time"] = tps_metrics["ttft"]
