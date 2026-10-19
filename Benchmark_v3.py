@@ -1,6 +1,4 @@
-### This Version should support Linux/Mac OS/BSD/Windows.
-# Part 1
-
+### Part 1
 import os
 import sys
 import json
@@ -58,8 +56,6 @@ def save_model_to_ini(model_key, provider):
         config.write(f)
     print(f"[INI UPDATE] Saved model '{model_key}' with target backend '{provider}'.")
 
-ini_settings = load_dynamic_settings()
-
 def extract_text_from_archive(path):
     """Extracts raw text content natively from folders, tarballs, gz, bz2, and 7z archives."""
     corpus_chunks = []
@@ -107,7 +103,27 @@ def extract_text_from_archive(path):
             
     return "\n".join(corpus_chunks)
 
+def load_checkpoint_state():
+    """Loads historical successful configuration matrix data runs straight out of progress memory."""
+    state_path = "llm_bench_state.json"
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception: pass
+    return []
+
+def append_checkpoint_run(run_entry):
+    """Appends an individual metric data track line straight to the JSON recovery file."""
+    state_path = "llm_bench_state.json"
+    current_state = load_checkpoint_state()
+    current_state.append(run_entry)
+    try:
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(current_state, f, indent=2)
+    except Exception: pass
 # Part 2
+
 def generate_synthetic_context(target_token_count, source_path):
     """Generates context string data using local files, falling back to static blocks to prevent token deadlocks."""
     raw_text = extract_text_from_archive(path=source_path)
@@ -132,14 +148,19 @@ def resolve_active_lmstudio_port():
     except Exception: pass
     return 1234
 
-def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_threads, moe_experts, agent_slots, context_size, fill_ratio, cli_source_override=None):
-    """Orchestrates hardware layer parameters and profiles streaming throughput cleanly across server types."""
+def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_threads, moe_experts, agent_slots, context_size, fill_ratio, global_start_time, stop_after_sec, cli_source_override=None):
+    """Orchestrates layer configurations and enforces hard deadline exits during execution phases."""
+    # Hard Cutoff Check before starting this configuration block load
+    if stop_after_sec and (time.perf_counter() - global_start_time) >= stop_after_sec:
+        print("\n[TIMEOUT] Hard deadline limit expired. Ending loop operations immediately.")
+        return "HARD_STOP"
+
     active_ini = load_dynamic_settings()
     source_target = cli_source_override if cli_source_override else active_ini.get("source_text_directory", "./benchmark_corpus")
     task_prompt = active_ini.get("test_prompt")
     provider = str(provider).strip().lower()
-
     model_key = str(model_key).strip()
+    
     layers_display = "ALL" if gpu_layers == -1 else f"{gpu_layers}/{max_layers_bound}"
     print(f"  [PROBE] Target Backend: {provider.upper()} -> Layers: {layers_display} | CPU Threads: {cpu_threads} | Agent Slots: {agent_slots} | Window: {context_size}")
     tps_metrics = {"prefill_time": -1.0, "prefill_speed": -1.0, "generation_speed": -1.0, "ttft": -1.0}
@@ -147,19 +168,16 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
     use_shell = True if os.name == 'nt' else False
     
     try:
-        # Pre-build context strings before triggering memory switches
         allocated_fill_tokens = int(context_size * fill_ratio) - 300
         if allocated_fill_tokens < 100: allocated_fill_tokens = 100
         context_data = generate_synthetic_context(allocated_fill_tokens, source_target)
         final_prompt = f"CONTEXT DATABASE:\n{context_data}\n\nTASK COMMAND:\n{task_prompt}"
 
-        # Calculate offload floats
         if gpu_layers == -1 or max_layers_bound <= 0:
             gpu_ratio_arg = 1.0
         else:
             gpu_ratio_arg = round(max(0.0, min(1.0, gpu_layers / float(max_layers_bound))), 3)
 
-        # ENGINE BRANCH 1: LM STUDIO HOOK ARCHITECTURE
         if provider == "lmstudio":
             try:
                 subprocess.run(["lms", "unload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=use_shell)
@@ -174,29 +192,17 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
             time.sleep(5)
             
             target_url = f"http://127.0.0.1:{resolve_active_lmstudio_port()}/v1/chat/completions"
-            payload = {
-                "model": "bench-model", "messages": [{"role": "user", "content": final_prompt}], "temperature": 0.1, "stream": True
-            }
-
-        # ENGINE BRANCH 2: OLLAMA SERVER HOOK ARCHITECTURE
+            payload = {"model": "bench-model", "messages": [{"role": "user", "content": final_prompt}], "temperature": 0.1, "stream": True}
         else:
             target_url = "http://127.0.0"
-            # Ollama takes native model layouts and runs parameters directly into the body layer array
             payload = {
-                "model": model_key,
-                "messages": [{"role": "user", "content": final_prompt}],
-                "stream": True,
+                "model": model_key, "messages": [{"role": "user", "content": final_prompt}], "stream": True,
                 "options": {
-                    "num_ctx": context_size,
-                    "num_predict": 512,
-                    "num_thread": cpu_threads,
-                    "num_gpu": gpu_layers if gpu_layers != -1 else 999,
-                    "num_experts": moe_experts,
-                    "temperature": 0.1
+                    "num_ctx": context_size, "num_predict": 512, "num_thread": cpu_threads,
+                    "num_gpu": gpu_layers if gpu_layers != -1 else 999, "num_experts": moe_experts, "temperature": 0.1
                 }
             }
 
-        # UNIFIED STREAM INFERENCE DRIVER PIPELINE
         start_pipeline = time.perf_counter()
         time_to_first_token = None
         total_generated_tokens = 0
@@ -210,12 +216,10 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
                         time_to_first_token = time.perf_counter() - start_pipeline
                     
                     chunk_str = chunk.decode("utf-8").strip()
-                    # Unified character delta parsing
                     if "content" in chunk_str or '"message"' in chunk_str:
                         total_generated_tokens += 1
                         
             total_duration = time.perf_counter() - start_pipeline
-            # Approximate baseline prompt tokens safely for output reporting metrics
             prompt_tokens = max(100, int(len(final_prompt) / 4))
             
             tps_metrics["ttft"] = time_to_first_token if time_to_first_token else 0.0
@@ -226,7 +230,7 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
             
             print(f"    -> Prefill Speed: {tps_metrics['prefill_speed']:.1f} t/s | Gen Speed: {tps_metrics['generation_speed']:.1f} t/s | TTFT: {tps_metrics['ttft']:.2f}s")
         else:
-            raise ConnectionError(f"Target server returned a bad status code response field: {response.status_code}")
+            raise ConnectionError(f"Target server returned error code: {response.status_code}")
         
     except Exception as e:
         print(f"    -> [CRASH/OOM] Backend configuration run failed: {e}")
@@ -241,17 +245,23 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
     time.sleep(2)
     return tps_metrics
 
-# Part 3
+### part 3
 
 def parse_cli_arguments():
-    """Parses command-line arguments for multi-backend hardware testing configurations."""
-    parser = argparse.ArgumentParser(description="Cross-Platform Multi-Backend (LM Studio / Ollama) MoE Thread Profiler.")
-    parser.add_argument("-b", "--backend", type=str, default=None, choices=["lmstudio", "ollama"], help="Target provider backend choice to run profiles against.")
+    """Parses command-line arguments for multi-backend hardware testing configurations with cutoff controls."""
+    parser = argparse.ArgumentParser(description="Cross-Platform Multi-Backend MoE Thread Profiler with Checkpointing.")
+    parser.add_argument("-b", "--backend", type=str, default=None, choices=["lmstudio", "ollama"], help="Target provider backend choice.")
     parser.add_argument("-m", "--model", type=str, default=None, help="Target model identifier string specifier name on disk.")
-    parser.add_argument("-s", "--source", type=str, default=None, help="Path to text folder or container file to use for context filling.")
-    parser.add_argument("-t", "--threads", type=int, default=None, help="Force override CPU thread worker constraints parameters.")
+    parser.add_argument("-s", "--source", type=str, default=None, help="Path to text folder or container file.")
+    parser.add_argument("-t", "--threads", type=int, default=None, help="Force override CPU thread worker constraints.")
     parser.add_argument("--sweep-gpu", action="store_true", help="Force sequentially sweeping layer splits step by step.")
     parser.add_argument("--context-fill-override", type=float, default=None, help="Override target context window fill value fraction.")
+    
+    # RESTORED / ADDED: Execution lifecycle checkpoints and deadline parameters
+    parser.add_argument("-c", "--continue", dest="continue_run", action="store_true", help="Read progress state and start from where the last successful benchmark finished.")
+    parser.add_argument("--stop-after", type=int, default=None, help="Stop after time just ends the test immediately (Minutes limit).")
+    parser.add_argument("--stop-grace", type=int, default=None, help="Stop after time but let the currently running test finish completely (Minutes limit).")
+    
     parser.add_argument("--min-layers", type=int, default=None)
     parser.add_argument("--max-layers", type=int, default=None)
     parser.add_argument("--min-context", type=int, default=None)
@@ -259,8 +269,8 @@ def parse_cli_arguments():
     parser.add_argument("--context-step", type=int, default=None)
     return parser.parse_args()
 
-def execute_binary_search_layers(args, provider, model_key, max_layers_bound, cpu_threads, moe_experts, slots, context_size, fill_ratio, min_l, max_l, results_accumulator):
-    """Executes a binary search sweep targeting optimal hardware layers offload bounds mapping matrices."""
+def execute_binary_search_layers(args, provider, model_key, max_layers_bound, cpu_threads, moe_experts, slots, context_size, fill_ratio, min_l, max_l, global_start_time, stop_after_sec, completed_keys, results_accumulator):
+    """Executes a binary search sweep targeting optimal layers while tracking historical checkpoints and deadlines."""
     low = min_l
     high = max_l if max_l != -1 else 64
     evaluation_cache = {}
@@ -269,27 +279,50 @@ def execute_binary_search_layers(args, provider, model_key, max_layers_bound, cp
         mid = (low + high) // 2
         if mid in evaluation_cache: break
             
-        metrics = probe_configuration(provider, model_key, mid, max_layers_bound, cpu_threads, moe_experts, slots, context_size, fill_ratio, cli_source_override=args.source)
+        key_signature = f"{context_size}_{mid}_{cpu_threads}_{slots}"
+        if key_signature in completed_keys:
+            print(f"  [CHECKPOINT SKIP] Layer layout {mid} detected in history storage registers.")
+            low = mid + 1 # Dynamic forward progression shortcut path trace
+            continue
+
+        metrics = probe_configuration(provider, model_key, mid, max_layers_bound, cpu_threads, moe_experts, slots, context_size, fill_ratio, global_start_time, stop_after_sec, cli_source_override=args.source)
+        
+        if metrics == "HARD_STOP": return "HARD_STOP"
         evaluation_cache[mid] = metrics
         
         if metrics is None:
-            results_accumulator.append({"context": context_size, "gpu_layers": mid, "threads": cpu_threads, "moe_experts": moe_experts, "slots": slots, "gen_speed": -1.0, "ttft": -1.0, "status": "OOM/CRASH"})
+            entry = {"context": context_size, "gpu_layers": mid, "threads": cpu_threads, "moe_experts": moe_experts, "slots": slots, "gen_speed": -1.0, "ttft": -1.0, "status": "OOM/CRASH"}
+            results_accumulator.append(entry)
+            append_checkpoint_run(entry)
             high = mid - 1
             continue
             
-        results_accumulator.append({"context": context_size, "gpu_layers": mid, "threads": cpu_threads, "moe_experts": moe_experts, "slots": slots, "gen_speed": metrics["generation_speed"], "ttft": metrics["ttft"], "status": "SUCCESS"})
+        entry = {"context": context_size, "gpu_layers": mid, "threads": cpu_threads, "moe_experts": moe_experts, "slots": slots, "gen_speed": metrics["generation_speed"], "ttft": metrics["ttft"], "status": "SUCCESS"}
+        results_accumulator.append(entry)
+        append_checkpoint_run(entry)
         
         current_span = high - low
         step_reduction = max(1, int(current_span * 0.25))
         slope_step = mid - step_reduction
         
         if slope_step >= min_l and slope_step not in evaluation_cache:
-            prev_m = probe_configuration(provider, model_key, slope_step, max_layers_bound, cpu_threads, moe_experts, slots, context_size, fill_ratio, cli_source_override=args.source)
+            slope_sig = f"{context_size}_{slope_step}_{cpu_threads}_{slots}"
+            if slope_sig in completed_keys:
+                low = mid + 1
+                continue
+                
+            prev_m = probe_configuration(provider, model_key, slope_step, max_layers_bound, cpu_threads, moe_experts, slots, context_size, fill_ratio, global_start_time, stop_after_sec, cli_source_override=args.source)
+            if prev_m == "HARD_STOP": return "HARD_STOP"
             evaluation_cache[slope_step] = prev_m
+            
             if prev_m:
-                results_accumulator.append({"context": context_size, "gpu_layers": slope_step, "threads": cpu_threads, "moe_experts": moe_experts, "slots": slots, "gen_speed": prev_m["generation_speed"], "ttft": prev_m["ttft"], "status": "SUCCESS"})
+                slope_entry = {"context": context_size, "gpu_layers": slope_step, "threads": cpu_threads, "moe_experts": moe_experts, "slots": slots, "gen_speed": prev_m["generation_speed"], "ttft": prev_m["ttft"], "status": "SUCCESS"}
+                results_accumulator.append(slope_entry)
+                append_checkpoint_run(slope_entry)
             else:
-                results_accumulator.append({"context": context_size, "gpu_layers": slope_step, "threads": cpu_threads, "moe_experts": moe_experts, "slots": slots, "gen_speed": -1.0, "ttft": -1.0, "status": "OOM/CRASH"})
+                slope_entry = {"context": context_size, "gpu_layers": slope_step, "threads": cpu_threads, "moe_experts": moe_experts, "slots": slots, "gen_speed": -1.0, "ttft": -1.0, "status": "OOM/CRASH"}
+                results_accumulator.append(slope_entry)
+                append_checkpoint_run(slope_entry)
         
         current_tps = metrics["generation_speed"]
         prev_tps_obj = evaluation_cache.get(slope_step, None)
@@ -297,6 +330,33 @@ def execute_binary_search_layers(args, provider, model_key, max_layers_bound, cp
 
         if current_tps > prev_tps_val: low = mid + 1
         else: high = mid - 1
+
+def fetch_ollama_models(use_shell):
+    models = []
+    try:
+        res = subprocess.run(["ollama", "list"], capture_output=True, text=True, shell=use_shell)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines()[1:]:
+                parts = line.split()
+                if parts: models.append(parts[0])
+    except Exception: pass
+    return sorted(list(set(models)))
+
+def get_installed_lmstudio_models():
+    models = []
+    cmd = ["lms", "ls", "--json"]
+    use_shell = True if os.name == 'nt' else False
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=use_shell, check=True)
+        json_data = json.loads(result.stdout)
+        if isinstance(json_data, list):
+            for item in json_data:
+                if "path" in item: models.append(str(item["path"]).strip())
+        elif isinstance(json_data, dict) and "models" in json_data:
+            for item in json_data["models"]:
+                if "path" in item: models.append(str(item["path"]).strip())
+    except Exception: pass
+    return sorted(list(set(models)))
 
 def generate_yaml_fallback(data_dict):
     yaml_lines = ["# Automated LLM Profile Configuration"]
@@ -307,10 +367,13 @@ def generate_yaml_fallback(data_dict):
         else: yaml_lines.append(f"{key}: {val}")
     return "\n".join(yaml_lines)
 
+### part 4
+
 if __name__ == "__main__":
     args = parse_cli_arguments()
     fresh_settings = load_dynamic_settings()
     
+    use_shell = True if os.name == 'nt' else False
     active_backend = args.backend if args.backend else fresh_settings.get("backend_provider", "lmstudio").strip().lower()
     target_fill = args.context_fill_override if args.context_fill_override is not None else float(fresh_settings.get("context_target_fill", 0.90))
     min_layers = args.min_layers if args.min_layers is not None else int(fresh_settings.get("min_gpu_layers", 0))
@@ -326,9 +389,34 @@ if __name__ == "__main__":
         
     min_agents = int(fresh_settings.get("min_agent_slots", 1))
     max_agents = int(fresh_settings.get("max_agent_slots", 2))
-    
     force_sweep_gpu = True if args.sweep_gpu else False
+
+    # Establish timing constraint parameters mapping
+    global_clock_start = time.perf_counter()
+    stop_after_seconds = None
+    grace_mode = False
     
+    if args.stop_after:
+        stop_after_seconds = args.stop_after * 60
+    elif args.stop_grace:
+        stop_after_seconds = args.stop_grace * 60
+        grace_mode = True
+
+    # Check for recovery state continue signals
+    completed_signatures = set()
+    all_runs = []
+    if args.continue_run:
+        historical_records = load_checkpoint_state()
+        all_runs.extend(historical_records)
+        for r in historical_records:
+            completed_signatures.add(f"{r['context']}_{r['gpu_layers']}_{r['threads']}_{r['slots']}")
+        print(f"[RECOVERY ENGAGED] Re-imported {len(historical_records)} processing records cleanly from history.")
+    else:
+        # Erase stale cache state file if a fresh non-recovery sweep loop is triggered
+        if os.path.exists("llm_bench_state.json"):
+            try: os.remove("llm_bench_state.json")
+            except Exception: pass
+            
     selected_model = None
     if args.model:
         selected_model = args.model
@@ -342,14 +430,34 @@ if __name__ == "__main__":
             print("\n" + "="*80)
             print("                   LOCAL MULTI-BACKEND MODEL WORKSPACE")
             print("="*80)
-            print(f"Active Backend Provider Selected Target: {active_backend.upper()}")
-            selected_model = input("Enter model identifier name (e.g. qwen2.5:7b or qwen/qwen3.8-27b): ").strip()
-            while not selected_model:
-                selected_model = input("Identifier entry cannot remain empty: ").strip()
-            save_choice = input("Save this configuration default in llm_bench.ini? (y/n): ").strip().lower()
+            print(f"Active Backend Provider Selected Target: {active_backend.upper()}\n")
+            
+            if active_backend == "ollama": available_models = fetch_ollama_models(use_shell)
+            else: available_models = get_installed_lmstudio_models()
+                
+            if available_models:
+                print("Discovered local model assets:")
+                for index, m_name in enumerate(available_models, start=1):
+                    print(f"  [{index}] {m_name}")
+                print("="*80)
+                while True:
+                    try:
+                        choice = input(f"Select a model number to benchmark (1-{len(available_models)}): ").strip()
+                        choice_idx = int(choice) - 1
+                        if 0 <= choice_idx < len(available_models):
+                            selected_model = available_models[choice_idx]
+                            break
+                        else: print(f"Invalid index. Range must be between 1 and {len(available_models)}.")
+                    except ValueError: print("Please enter a valid integer number.")
+            else:
+                print("[INFO] No running catalog entries returned from server handles.")
+                selected_model = input("Enter model identifier manually (e.g. qwen2.5:7b): ").strip()
+                while not selected_model:
+                    selected_model = input("Identifier entry cannot remain empty: ").strip()
+                    
+            save_choice = input("\nSave this configuration choice default in llm_bench.ini? (y/n): ").strip().lower()
             if save_choice in ['y', 'yes']: save_model_to_ini(selected_model, active_backend)
             
-    all_runs = []
     c_start = args.min_context if args.min_context is not None else int(fresh_settings.get("min_context", 2048))
     c_end = args.max_context if args.max_context is not None else int(fresh_settings.get("max_context", 8192))
     c_step = args.context_step if args.context_step is not None else int(fresh_settings.get("context_step", 2048))
@@ -357,23 +465,58 @@ if __name__ == "__main__":
     
     print(f"\n{'#'*80}\nRUNNING HIERARCHICAL CORES AND LAYERS SERVER PROFILE ENGINE\n{'#'*80}")
     
+    break_all_loops = False
+    
     for context in context_space:
+        if break_all_loops: break
         for agents in range(min_agents, max_agents + 1):
+            if break_all_loops: break
             for threads in range(min_cores, max_cores + 1, core_step):
+                # Grace Limit evaluation block sequence intercept
+                if stop_after_seconds and (time.perf_counter() - global_clock_start) >= stop_after_seconds:
+                    if grace_mode:
+                        print("\n[GRACE TIMEOUT] Time ceiling expired. Allowing current configuration parameters block to finish...")
+                    else:
+                        print("\n[HARD TIMEOUT] Absolute ceiling exceeded. Ending grid testing loop execution immediately.")
+                        break_all_loops = True
+                        break
+
                 print(f"\n--- ROUTE MATRIX: Context={context} | Threads={threads} | Server={active_backend.upper()} ---")
                 
                 if force_sweep_gpu and max_layers != -1:
                     for layer in range(min_layers, max_layers + 1):
-                        m = probe_configuration(active_backend, selected_model, layer, max_layers, threads, moe_active, agents, context, target_fill, cli_source_override=args.source)
-                        if m: all_runs.append({"context": context, "gpu_layers": layer, "threads": threads, "moe_experts": moe_active, "slots": agents, "gen_speed": m["generation_speed"], "ttft": m["ttft"], "status": "SUCCESS"})
-                        else: all_runs.append({"context": context, "gpu_layers": layer, "threads": threads, "moe_experts": moe_active, "slots": agents, "gen_speed": -1.0, "ttft": -1.0, "status": "OOM/CRASH"})
+                        sig = f"{context}_{layer}_{threads}_{agents}"
+                        if sig in completed_signatures: continue
+
+                        m = probe_configuration(active_backend, selected_model, layer, max_layers, threads, moe_active, agents, context, target_fill, global_clock_start, (None if grace_mode else stop_after_seconds), cli_source_override=args.source)
+                        
+                        if m == "HARD_STOP":
+                            break_all_loops = True
+                            break
+                        
+                        if m:
+                            entry = {"context": context, "gpu_layers": layer, "threads": threads, "moe_experts": moe_active, "slots": agents, "gen_speed": m["generation_speed"], "ttft": m["ttft"], "status": "SUCCESS"}
+                        else:
+                            entry = {"context": context, "gpu_layers": layer, "threads": threads, "moe_experts": moe_active, "slots": agents, "gen_speed": -1.0, "ttft": -1.0, "status": "OOM/CRASH"}
+                        
+                        all_runs.append(entry)
+                        append_checkpoint_run(entry)
                 else:
-                    execute_binary_search_layers(args, active_backend, selected_model, max_layers, threads, moe_active, agents, context, target_fill, min_layers, max_layers, all_runs)
+                    res_status = execute_binary_search_layers(args, active_backend, selected_model, max_layers, threads, moe_active, agents, context, target_fill, min_layers, max_layers, global_clock_start, (None if grace_mode else stop_after_seconds), completed_signatures, all_runs)
+                    if res_status == "HARD_STOP":
+                        break_all_loops = True
+                        break
+                        
+                # Re-check timeframe parameters at the closing edge of individual grid loops execution passes
+                if grace_mode and stop_after_seconds and (time.perf_counter() - global_clock_start) >= stop_after_seconds:
+                    print("\n[GRACE STOP] Halting loop sweeps sequence. Progress cached securely.")
+                    break_all_loops = True
+                    break
 
     successful_runs = [r for r in all_runs if r["gen_speed"] > 0]
     if not successful_runs:
-        print("\n[ERROR] All hardware configurations hit a boundary failure.")
-        sys.exit(1)
+        print("\n[INFO] Loop sweep halted safely before capturing successful run configurations.")
+        sys.exit(0)
         
     optimal_config = max(successful_runs, key=lambda x: x["gen_speed"])
 
@@ -392,7 +535,7 @@ if __name__ == "__main__":
         "backend_provider": active_backend,
         "target_optimized_metrics": {
             "context_length": optimal_config["context"],
-            "gpu_layers_offloaded": optimal_config["gpu_layers"],
+            "gpu_offload_ratio": optimal_config["gpu_layers"],
             "allocated_cpu_threads": optimal_config["threads"],
             "moe_active_experts": optimal_config["moe_experts"],
             "simulated_agent_slots": optimal_config["slots"],
@@ -400,6 +543,6 @@ if __name__ == "__main__":
             "expected_prompt_latency_ttft": f"{optimal_config['ttft']:.2f}s"
         }
     }
-	with open("llm_ai_profile.json", "w") as f: json.dump(export_data, f, indent=2)
-	with open("llm_ai_profile.yaml", "w") as f: f.write(generate_yaml_fallback(export_data))
-	print("Success: Multi-backend optimization matrices packaged and saved safely.")
+    with open("llm_ai_profile.json", "w") as f: json.dump(export_data, f, indent=2)
+    with open("llm_ai_profile.yaml", "w") as f: f.write(generate_yaml_fallback(export_data))
+    print("Success: Checked parameters logs packaged and saved safely.")
