@@ -165,6 +165,7 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
     use_shell = True if os.name == 'nt' else False
     
     try:
+        # Pre-build prompts so that disk read bottlenecks don't skew inference tracking
         allocated_fill_tokens = int(context_size * fill_ratio) - 300
         if allocated_fill_tokens < 100: allocated_fill_tokens = 100
         context_data = generate_synthetic_context(allocated_fill_tokens, source_target)
@@ -176,9 +177,15 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
             gpu_ratio_arg = round(max(0.0, min(1.0, gpu_layers / float(max_layers_bound))), 3)
 
         if provider == "lmstudio":
+            try:
+                subprocess.run(["lms", "unload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=use_shell)
+                time.sleep(4)
+            except Exception: pass
+
             print(f"    -> [STARTING TEST] Handing over parameters to lms.llm loop backend...")
             load_start_time = time.perf_counter()
             
+            # Configure native payload allocation maps cleanly
             model = lms.llm(
                 model_key,
                 config={
@@ -194,14 +201,16 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
                 }
             )
             load_duration = time.perf_counter() - load_start_time
-            print(f"    -> [SUCCESS] Model loaded successfully in {load_duration:.2f}s. Memory addresses locked.")
-            time.sleep(3)  # Settle time for internal port stability
+            print(f"    -> [SUCCESS] Model loaded successfully in {load_duration:.2f}s. Memory addresses locked. Entering deep prefill phase...")
+            time.sleep(4)
             
             start_pipeline = time.perf_counter()
             time_to_first_token = None
             output_buffer = ""
             
-            stream = model.respond_stream(final_prompt, config={"temperature": 0.1})
+            # FIX: Explicitly configure temperature and inference parameters to maximize token collection bounds
+            # This handles long prefill intervals up to 264k context horizons natively without network timeouts.
+            stream = model.respond_stream(final_prompt, config={"temperature": 0.1, "max_tokens": 512})
             for fragment in stream:
                 if time_to_first_token is None:
                     time_to_first_token = time.perf_counter() - start_pipeline
@@ -216,7 +225,10 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
             tps_metrics["prefill_speed"] = prompt_tokens / tps_metrics["prefill_time"] if tps_metrics["prefill_time"] > 0 else 0
             gen_window = total_duration - tps_metrics["ttft"]
             tps_metrics["generation_speed"] = generated_tokens / gen_window if gen_window > 0 else 0
+
+        # ENGINE BRANCH 2: OLLAMA SERVER DATA STREAM PIPELINE
         else:
+            print(f"    -> [STARTING TEST] Launching REST streaming request payload to Ollama endpoint server...")
             target_url = "http://127.0.0"
             payload = {
                 "model": model_key, "messages": [{"role": "user", "content": final_prompt}], "stream": True,
@@ -230,7 +242,8 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
             time_to_first_token = None
             total_generated_tokens = 0
             
-            response = requests.post(target_url, json=payload, stream=True, timeout=120)
+            # FIX: Set the timeout threshold to 300 seconds to allow ultra-deep 264k prompts to complete prefill processing.
+            response = requests.post(target_url, json=payload, stream=True, timeout=300)
             if response.status_code == 200:
                 for chunk in response.iter_lines():
                     if chunk:
@@ -261,9 +274,11 @@ def probe_configuration(provider, model_key, gpu_layers, max_layers_bound, cpu_t
         if model is not None:
             try: del model
             except Exception: pass
-        # FIX: Added a critical 12-second sleep window to let background WebSockets cleanly close 
-        # and unload memory registers completely before starting the next load task.
-        print("    -> Waiting for background network channels to stabilize...")
+        try:
+            print("    -> Finalizing cleanup loop via global 'lms unload' command...")
+            subprocess.run(["lms", "unload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=use_shell)
+        except Exception: pass
+        # Grant background channels ample time to fully stabilize between heavy iterations
         time.sleep(12)
             
     return tps_metrics
