@@ -12,6 +12,7 @@ import warnings
 import urllib.request
 from urllib.parse import urlparse, urljoin
 import ssl
+import threading
 
 print("[System] Booting RipWeb...", flush=True)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -52,6 +53,25 @@ def ensure_module(module_name, pip_name=None):
 ensure_module('py7zr')
 import py7zr
 
+def format_size(size_bytes):
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+
+def get_directory_stats(directory):
+    total_files = 0
+    total_bytes = 0
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            full_path = os.path.join(root, file)
+            if os.path.isfile(full_path):
+                total_files += 1
+                total_bytes += os.path.getsize(full_path)
+    return total_files, total_bytes
+
 def unpack_archive_file(archive_path, extract_dir):
     if not os.path.exists(archive_path):
         return
@@ -64,7 +84,12 @@ def unpack_archive_file(archive_path, extract_dir):
             zip_ref.extractall(extract_dir)
 
 def pack_archive_file(archive_path, source_dir):
+    file_count, byte_size = get_directory_stats(source_dir)
+    print(f"\n{CYAN}[i] Preparing to compress cache into archive...{RESET}")
+    print(f"{CYAN}    - Files to archive : {GREEN}{file_count}{RESET}")
+    print(f"{CYAN}    - Total uncompressed: {GREEN}{format_size(byte_size)}{RESET}")
     print(f"{CYAN}[i] Packing cache directory into staging archive...{RESET}", flush=True)
+    
     staging_path = archive_path + ".tmp"
     
     if archive_path.lower().endswith('.7z'):
@@ -108,10 +133,29 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "X-Requested-With, Content-Type, Accept")
         self.end_headers()
 
+    def guess_type(self, path):
+        base, ext = os.path.splitext(path)
+        if not ext and os.path.exists(path):
+            try:
+                with open(path, 'rb') as f:
+                    header_bytes = f.read(64)
+                    if b'<!DOCTYPE html>' in header_bytes or b'<html' in header_bytes:
+                        return 'text/html; charset=utf-8'
+            except Exception:
+                pass
+        return super().guess_type(path)
+
+    def translate_path(self, path):
+        translated = super().translate_path(path)
+        if not os.path.exists(translated):
+            base, ext = os.path.splitext(translated)
+            if not ext and os.path.exists(base + '.html'):
+                return base + '.html'
+        return translated
+
     def do_GET(self):
         translated = self.translate_path(self.path)
         
-        # FIX: Force root directory requests to save as index.html
         if self.path.endswith('/'):
             translated = os.path.join(translated, 'index.html')
         
@@ -133,17 +177,35 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                     
                     req = urllib.request.Request(live_url, headers={
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                        'Accept': '*/*',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                         'Accept-Encoding': 'identity',
                         'Referer': self.server.base_target_url
                     })
                     with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
                         if response.getcode() == 200:
                             content_data = response.read()
-                            with open(translated, 'wb') as f:
+                            file_size = len(content_data)
+                            
+                            save_path = translated
+                            if not os.path.splitext(save_path)[1] and (b'<!DOCTYPE html>' in content_data[:100] or b'<html' in content_data[:100]):
+                                save_path += '.html'
+
+                            with open(save_path, 'wb') as f:
                                 f.write(content_data)
+                                
+                            with self.server.stats_lock:
+                                self.server.download_count += 1
+                                self.server.total_bytes += file_size
+                                self.server.last_downloaded = live_url
+
                             if getattr(self.server, 'verbose_logging', False):
-                                print(f"\n{CYAN}[+] Downloaded:{RESET} {live_url}", flush=True)
+                                print(f"\n{CYAN}[+] Downloaded ({format_size(file_size)}):{RESET} {live_url}", flush=True)
+                            else:
+                                display_url = live_url if len(live_url) <= 50 else live_url[:47] + "..."
+                                size_str = format_size(self.server.total_bytes)
+                                sys.stdout.write(f"\r\033[K{CYAN}[i] Files:{RESET} {self.server.download_count} | {CYAN}Total Size:{RESET} {size_str} | {GREEN}Last:{RESET} {display_url}")
+                                sys.stdout.flush()
+
                             self.server.archive_needs_update = True
                 except Exception as e:
                     if getattr(self.server, 'verbose_logging', False):
@@ -191,6 +253,10 @@ def main():
             httpd.base_target_url = args.target
             httpd.archive_needs_update = False
             httpd.verbose_logging = args.verbose
+            httpd.download_count = 0
+            httpd.total_bytes = 0
+            httpd.last_downloaded = "None"
+            httpd.stats_lock = threading.Lock()
             
             print(f"\n{GREEN}======================================================={RESET}")
             print(f"{GREEN}[✔] Proxy server is running!{RESET}")
@@ -206,7 +272,6 @@ def main():
     except KeyboardInterrupt:
         print(f"\n\n{YELLOW}Server shut down initiated.{RESET}", flush=True)
         if 'httpd' in locals() and getattr(httpd, 'archive_needs_update', False):
-            print(f"{CYAN}New assets lazy-loaded. Updating archive...{RESET}", flush=True)
             pack_archive_file(archive_name, serve_dir)
         else:
             print(f"{GREEN}No new files were downloaded. Archive left unchanged.{RESET}")
