@@ -35,37 +35,38 @@ Flag,Full Name,Description,Default
 -dm,--download-manager,Toggles injected in-browser toolbar UI (on or off).,on
 -l,--lazy-cache,Toggles writing proxied web assets directly to disk (on or off).,on
 -c,--create-portable,Generates portable offline package without starting server (directory or jar).,None
+```
 
-# Execution Examples
+### Execution Examples
 Example 1: Standard Mirroring with Custom Directory Cache
 Start archiving a target site on port 1337 and keep the uncompressed folder on drive F:
 
-Bash:
+```Bash:
 python RipWeb_complex.py [https://archive.org/download/the-bill-complete-series-1-to-26/](https://archive.org/download/the-bill-complete-series-1-to-26/) -p 1337 -t F:\web\Internet_Archive -s
-
+```
 Example 2: Target Custom .7z Archive Output
 Cache files to a 7-Zip file named media_archive.7z:
-
+```
 python RipWeb_complex.py [https://example.com/gallery](https://example.com/gallery) -a media_archive.7z
-
+```
 Example 3: Offline Portable Package Generation
 Build a 2-file JS-Jar client-side browser loader from an existing archive:
-
+```
 python RipWeb_complex.py -a media_archive.zip -c jar
+```
 
 ## 3. Console & Injected UI Controls
+```
 Terminal Dashboard Hotkeys (Press Key + Enter)
 L / l (Lock): Freezes local site cache. Rejects any live requests to remote servers.
-
 U / u (Unlock): Unfreezes local site cache, re-enabling live proxying.
-
 E / e (Export): Triggers the offline portable wizard.
-
 H / h (Help): Opens full CLI documentation.
-
 Q / q (Quit): Gracefully stops the HTTP server, compresses the cache into the specified archive, and exits.
+```
 
-Browser Web Toolbar Buttons
+### Browser Web Toolbar Buttons:
+```
 Lazy-Queue: Toggles automatic links detection via viewport scrolling.
 
 Auto-Download: Instantly begins downloading matched media items as soon as they enter the queue.
@@ -79,7 +80,7 @@ DL Selected: Commences downloading checked items in the toolbar drawer.
 Resync Sizes: Sends HEAD requests to compare remote vs local byte lengths for verification.
 
 Clear Finished: Purges validated downloads from the queue drawer list.
-
+```
 ## 4. Technical Limitations
 Single-Origin Proxying: RipWeb translates URLs tied to the target host domain. Multi-domain cross-origin links (e.g., media hosted across external third-party CDNs or S3 buckets) will bypass the local domain mapping unless rewritten explicitly.
 
