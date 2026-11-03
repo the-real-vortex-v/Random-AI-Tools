@@ -17,7 +17,7 @@ import hashlib
 import re
 import json
 
-print("[System] Booting RipWeb...", flush=True)
+print("[System] Booting RipWeb Enterprise...", flush=True)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 if os.name == 'nt':
@@ -71,6 +71,23 @@ def smart_truncate(text, max_len=70):
     tail = max_len - lead - 3
     return text[:lead] + "..." + text[-tail:]
 
+def atomic_save(tmp_path, final_path):
+    """Safely replace target file only when temporary download is fully complete."""
+    try:
+        os.replace(tmp_path, final_path)
+    except OSError:
+        try:
+            if os.path.exists(final_path):
+                try: os.remove(final_path)
+                except OSError: pass
+            os.rename(tmp_path, final_path)
+        except OSError:
+            pass
+    finally:
+        if os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except OSError: pass
+
 def get_directory_stats(directory):
     total_files = 0
     total_bytes = 0
@@ -123,6 +140,145 @@ def pack_archive_file(archive_path, source_dir):
         os.remove(archive_path)
     os.rename(staging_path, archive_path)
     print(f"{GREEN}[✔] Archive successfully updated!{RESET}", flush=True)
+
+def inject_toolbar(html_bytes):
+    """Injects the UI dynamically for serving. We strip old cached UI strings to prevent trapping the user in an old version."""
+    try:
+        text = html_bytes.decode('utf-8', errors='ignore')
+        
+        # Purge any old injected toolbars from previously cached html
+        text = re.sub(r'<style>\s*@keyframes rip-spin.*?</script>', '', text, flags=re.IGNORECASE | re.DOTALL)
+        
+        toolbar_js = """
+        <style>
+            @keyframes rip-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            .rip-spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: #4af; animation: rip-spin 0.8s linear infinite; }
+        </style>
+        <script>
+            function ensureRipToolbar() {
+                if (document.getElementById('ripweb-toolbar')) return;
+                const div = document.createElement('div');
+                div.id = 'ripweb-toolbar';
+                div.style.cssText = 'position:fixed; bottom:15px; right:15px; z-index:999999; background:rgba(18,18,18,0.96); color:#fff; width:440px; border-radius:10px; font-family:sans-serif; font-size:12px; box-shadow:0 6px 25px rgba(0,0,0,0.8); border:1px solid #444; overflow:hidden;';
+                div.innerHTML = `
+                    <div style="background:#222; padding:10px 14px; font-weight:bold; color:#4af; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #333;">
+                        <span>📥 RipWeb Enterprise Download Manager</span>
+                        <button onclick="toggleRipDrawer()" style="background:none; border:none; color:#aaa; cursor:pointer; font-size:14px;">▲</button>
+                    </div>
+                    <div id="ripweb-drawer" style="padding:12px; display:flex; flex-direction:column; gap:10px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <label style="display:flex; align-items:center; cursor:pointer; font-weight:500; font-size:11px;">
+                                <input type="checkbox" id="ripweb-toggle-intercept" style="margin-right:4px;" onchange="toggleIntercept(this)">
+                                Auto-Cache Clicked
+                            </label>
+                            <div style="display:flex; gap:6px;">
+                                <button onclick="scanAndQueueFiles(true)" style="background:#007acc; color:#fff; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:11px;">Scan & Download</button>
+                                <button onclick="rescanAllFiles()" style="background:#28a745; color:#fff; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:11px;" title="Rescan and Resync Queue">Rescan/Resync</button>
+                            </div>
+                        </div>
+                        <div style="font-weight:600; color:#aaa; font-size:11px; text-transform:uppercase; margin-top:2px; display:flex; justify-content:space-between;">
+                            <span>Discovered Files Queue</span>
+                            <span id="ripweb-queue-count" style="color:#4af;">0 files</span>
+                        </div>
+                        <div id="ripweb-queue-list" style="max-height:340px; overflow-y:auto; background:#111; border:1px solid #333; border-radius:6px; padding:6px; display:flex; flex-direction:column; gap:5px;">
+                            <div style="color:#666; text-align:center; padding:20px; font-style:italic;">Click 'Scan & Download' to load files</div>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(div);
+                
+                const isIntercept = localStorage.getItem('ripweb_intercept') === '1';
+                const cb = document.getElementById('ripweb-toggle-intercept');
+                if (cb) cb.checked = isIntercept;
+                scanAndQueueFiles(false);
+                setInterval(updateQueueUI, 3000);
+            }
+
+            function toggleRipDrawer() {
+                const drawer = document.getElementById('ripweb-drawer');
+                const btn = event.target;
+                if (!drawer) return;
+                if (drawer.style.display === 'none') {
+                    drawer.style.display = 'flex';
+                    btn.innerText = '▲';
+                } else {
+                    drawer.style.display = 'none';
+                    btn.innerText = '▼';
+                }
+            }
+            function toggleIntercept(el) {
+                localStorage.setItem('ripweb_intercept', el.checked ? '1' : '0');
+            }
+            function scanAndQueueFiles(autoQueue = true) {
+                const links = [];
+                document.querySelectorAll('a, source, video, audio').forEach(el => {
+                    const href = el.href || el.src;
+                    if (href && /\.(mp4|mp3|mkv|zip|pdf|m4a|m4v|rar|7z|flac|wav)$/i.test(href)) {
+                        if (!links.includes(href)) links.push(href);
+                    }
+                });
+                if (links.length === 0) {
+                    updateQueueUI();
+                    return;
+                }
+                
+                fetch('/_ripweb/register-links', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({urls: links, auto_download: autoQueue})
+                }).then(res => res.json()).then(data => { updateQueueUI(); });
+            }
+            function rescanAllFiles() {
+                scanAndQueueFiles(false);
+                fetch('/_ripweb/rescan', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'}
+                }).then(res => res.json()).then(data => { updateQueueUI(); });
+            }
+            function updateQueueUI() {
+                fetch('/_ripweb/queue-status').then(res => res.json()).then(data => {
+                    const list = document.getElementById('ripweb-queue-list');
+                    const countEl = document.getElementById('ripweb-queue-count');
+                    if (!list || !countEl) return;
+                    if (!data.queue || data.queue.length === 0) {
+                        list.innerHTML = '<div style="color:#666; text-align:center; padding:20px; font-style:italic;">No files found</div>';
+                        countEl.innerText = '0 files';
+                        return;
+                    }
+                    countEl.innerText = `${data.queue.length} files`;
+                    let html = '';
+                    data.queue.forEach(item => {
+                        let icon = '<span style="color:#888;" title="Pending">⏳</span>';
+                        if (item.status === 'downloading') {
+                            icon = '<span class="rip-spinner" title="Downloading..."></span>';
+                        } else if (item.status === 'completed') {
+                            icon = '<span style="color:#42d4f4; font-weight:bold;" title="Downloaded">✔</span>';
+                        } else if (item.status === 'failed') {
+                            icon = '<span style="color:#ff4d4d; font-weight:bold;" title="Failed">✘</span>';
+                        }
+                        html += `<div style="display:flex; align-items:center; gap:8px; background:#1a1a1a; padding:6px 8px; border-radius:4px; font-size:11px;">
+                            <div style="width:16px; text-align:center;">${icon}</div>
+                            <div style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${item.url}"><a href="${item.url}" target="_blank" style="color:#60a5fa; text-decoration:none;">${item.name}</a></div>
+                            <div style="color:#aaa; font-size:10px; font-weight:bold; white-space:nowrap;">${item.size || item.status}</div>
+                        </div>`;
+                    });
+                    list.innerHTML = html;
+                });
+            }
+
+            window.addEventListener('DOMContentLoaded', ensureRipToolbar);
+            setTimeout(ensureRipToolbar, 1000);
+        </script>
+        """
+        
+        if re.search(r'<body[^>]*>', text, flags=re.IGNORECASE):
+            text = re.sub(r'(<body[^>]*>)', r'\1' + toolbar_js, text, flags=re.IGNORECASE, count=1)
+        else:
+            text = toolbar_js + text
+            
+        return text.encode('utf-8')
+    except Exception:
+        return html_bytes
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
@@ -234,150 +390,30 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                 content_text = content_text.replace(s, proxy_url)
                 content_text = content_text.replace(s.replace('/', r'\/'), proxy_url_escaped)
             
-            toolbar_html = """
-            <style>
-                @keyframes rip-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-                .rip-spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: #4af; animation: rip-spin 0.8s linear infinite; }
-            </style>
-            <div id="ripweb-toolbar" style="position:fixed; bottom:15px; right:15px; z-index:999999; background:rgba(18,18,18,0.96); color:#fff; width:420px; border-radius:10px; font-family:sans-serif; font-size:12px; box-shadow:0 6px 25px rgba(0,0,0,0.8); border:1px solid #444; overflow:hidden;">
-                <div style="background:#222; padding:10px 14px; font-weight:bold; color:#4af; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #333;">
-                    <span>📥 RipWeb Download Manager</span>
-                    <button onclick="toggleRipDrawer()" style="background:none; border:none; color:#aaa; cursor:pointer; font-size:14px;">▲</button>
-                </div>
-                <div id="ripweb-drawer" style="padding:12px; display:flex; flex-direction:column; gap:10px;">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <label style="display:flex; align-items:center; cursor:pointer; font-weight:500; font-size:11px;">
-                            <input type="checkbox" id="ripweb-toggle-intercept" style="margin-right:4px;" onchange="toggleIntercept(this)">
-                            Auto-Cache Clicked
-                        </label>
-                        <div style="display:flex; gap:6px;">
-                            <button onclick="scanAndQueueFiles(false)" style="background:#007acc; color:#fff; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:11px;">Scan</button>
-                            <button onclick="rescanAllFiles()" style="background:#28a745; color:#fff; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:11px;">Rescan</button>
-                        </div>
-                    </div>
-                    <div style="font-weight:600; color:#aaa; font-size:11px; text-transform:uppercase; margin-top:2px; display:flex; justify-content:space-between;">
-                        <span>Discovered Files Queue</span>
-                        <span id="ripweb-queue-count" style="color:#4af;">0 files</span>
-                    </div>
-                    <div id="ripweb-queue-list" style="max-height:340px; overflow-y:auto; background:#111; border:1px solid #333; border-radius:6px; padding:6px; display:flex; flex-direction:column; gap:5px;">
-                        <div style="color:#666; text-align:center; padding:20px; font-style:italic;">Click 'Scan' to load files</div>
-                    </div>
-                </div>
-            </div>
-            <script>
-                function toggleRipDrawer() {
-                    const drawer = document.getElementById('ripweb-drawer');
-                    const btn = event.target;
-                    if (drawer.style.display === 'none') {
-                        drawer.style.display = 'flex';
-                        btn.innerText = '▲';
-                    } else {
-                        drawer.style.display = 'none';
-                        btn.innerText = '▼';
-                    }
-                }
-                function toggleIntercept(el) {
-                    localStorage.setItem('ripweb_intercept', el.checked ? '1' : '0');
-                }
-                window.addEventListener('DOMContentLoaded', () => {
-                    const isIntercept = localStorage.getItem('ripweb_intercept') === '1';
-                    document.getElementById('ripweb-toggle-intercept').checked = isIntercept;
-                    
-                    scanAndQueueFiles(false);
-                    setInterval(updateQueueUI, 1000);
-
-                    document.addEventListener('click', function(e) {
-                        const a = e.target.closest('a');
-                        if (a && localStorage.getItem('ripweb_intercept') === '1') {
-                            if (/\\.(mp4|mp3|mkv|zip|pdf|m4a|m4v|rar|7z)$/i.test(a.href)) {
-                                e.preventDefault();
-                                queueFiles([a.href]);
-                            }
-                        }
-                    });
-                });
-                function queueFiles(urls) {
-                    fetch('/_ripweb/bulk-download', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({urls: urls})
-                    }).then(res => res.json()).then(data => {
-                        updateQueueUI();
-                    });
-                }
-                function scanAndQueueFiles(autoQueue = true) {
-                    const links = [];
-                    document.querySelectorAll('a').forEach(a => {
-                        if (/\\.(mp4|mp3|mkv|zip|pdf|m4a|m4v|rar|7z)$/i.test(a.href)) {
-                            if (!links.includes(a.href)) links.push(a.href);
-                        }
-                    });
-                    if (links.length === 0) return;
-                    
-                    fetch('/_ripweb/register-links', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({urls: links, auto_download: autoQueue})
-                    }).then(res => res.json()).then(data => {
-                        updateQueueUI();
-                    });
-                }
-                function rescanAllFiles() {
-                    fetch('/_ripweb/rescan', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'}
-                    }).then(res => res.json()).then(data => {
-                        updateQueueUI();
-                    });
-                }
-                function updateQueueUI() {
-                    fetch('/_ripweb/queue-status').then(res => res.json()).then(data => {
-                        const list = document.getElementById('ripweb-queue-list');
-                        const countEl = document.getElementById('ripweb-queue-count');
-                        if (!data.queue || data.queue.length === 0) {
-                            list.innerHTML = '<div style="color:#666; text-align:center; padding:20px; font-style:italic;">No files found</div>';
-                            countEl.innerText = '0 files';
-                            return;
-                        }
-                        countEl.innerText = `${data.queue.length} files`;
-                        let html = '';
-                        data.queue.forEach(item => {
-                            let icon = '<span style="color:#888;" title="Pending">⏳</span>';
-                            if (item.status === 'downloading') {
-                                icon = '<span class="rip-spinner" title="Downloading..."></span>';
-                            } else if (item.status === 'completed') {
-                                icon = '<span style="color:#42d4f4; font-weight:bold;" title="Downloaded">✔</span>';
-                            } else if (item.status === 'failed') {
-                                icon = '<span style="color:#ff4d4d; font-weight:bold;" title="Failed">✘</span>';
-                            }
-                            html += `<div style="display:flex; align-items:center; gap:8px; background:#1a1a1a; padding:6px 8px; border-radius:4px; font-size:11px;">
-                                <div style="width:16px; text-align:center;">${icon}</div>
-                                <div style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${item.url}">${item.name}</div>
-                                <div style="color:#888; font-size:10px;">${item.size || item.status}</div>
-                            </div>`;
-                        });
-                        list.innerHTML = html;
-                    });
-                }
-            </script>
-            """
-            
-            # Robust injection right after the <body> tag to guarantee visibility
-            if re.search(r'<body[^>]*>', content_text, flags=re.IGNORECASE):
-                content_text = re.sub(r'(<body[^>]*>)', r'\1' + toolbar_html, content_text, flags=re.IGNORECASE, count=1)
-            else:
-                content_text = toolbar_html + content_text
-            
             return content_text.encode('utf-8')
         except Exception:
             return content_bytes
 
     def serve_local_file(self, file_path):
         try:
+            ctype = self.guess_type(file_path)
+            is_html = 'text/html' in ctype
+            
+            if is_html:
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                data = inject_toolbar(data)
+                file_len = len(data)
+                self.send_response(200)
+                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Length', str(file_len))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
             f = open(file_path, 'rb')
             fs = os.fstat(f.fileno())
             file_len = fs.st_size
-            ctype = self.guess_type(file_path)
 
             if 'Range' in self.headers:
                 match = re.search(r'bytes=(\d+)-(\d*)', self.headers['Range'])
@@ -435,14 +471,14 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         if self.path == '/_ripweb/queue-status':
             with self.server.queue_lock:
                 for u, info in self.server.download_queue.items():
-                    decoded_url_path = unquote(urlparse(u).path)
-                    save_dest = os.path.join(self.server.serve_dir, decoded_url_path.lstrip('/'))
-                    if os.path.exists(save_dest) and os.path.getsize(save_dest) > 100: # Ensure valid file size (>100 bytes)
-                        disk_size = os.path.getsize(save_dest)
-                        info["status"] = "completed"
-                        info["size"] = format_size(disk_size)
-                    else:
-                        if info["status"] == "completed":
+                    if info["status"] not in ["downloading", "failed"]:
+                        decoded_url_path = unquote(urlparse(u).path)
+                        save_dest = os.path.join(self.server.serve_dir, decoded_url_path.lstrip('/'))
+                        
+                        if os.path.exists(save_dest) and os.path.getsize(save_dest) > 0:
+                            info["status"] = "completed"
+                            info["size"] = format_size(os.path.getsize(save_dest))
+                        else:
                             info["status"] = "pending"
                             info["size"] = "Queued"
                 q_data = list(self.server.download_queue.values())
@@ -457,17 +493,16 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             urls_to_redownload = []
             with self.server.queue_lock:
                 for u, info in self.server.download_queue.items():
-                    decoded_url_path = unquote(urlparse(u).path)
-                    save_dest = os.path.join(self.server.serve_dir, decoded_url_path.lstrip('/'))
-                    # Check if file exists and is valid (greater than 100 bytes, avoiding error HTML pages)
-                    if os.path.exists(save_dest) and os.path.getsize(save_dest) > 100:
-                        disk_size = os.path.getsize(save_dest)
-                        info["status"] = "completed"
-                        info["size"] = format_size(disk_size)
-                    else:
-                        info["status"] = "pending"
-                        info["size"] = "Queued"
-                        urls_to_redownload.append(u)
+                    if info["status"] not in ["downloading"]:
+                        decoded_url_path = unquote(urlparse(u).path)
+                        save_dest = os.path.join(self.server.serve_dir, decoded_url_path.lstrip('/'))
+                        if os.path.exists(save_dest) and os.path.getsize(save_dest) > 0:
+                            info["status"] = "completed"
+                            info["size"] = format_size(os.path.getsize(save_dest))
+                        else:
+                            info["status"] = "pending"
+                            info["size"] = "Queued"
+                            urls_to_redownload.append(u)
 
             if urls_to_redownload:
                 threading.Thread(target=self.server.process_download_queue, args=(urls_to_redownload,), daemon=True).start()
@@ -493,13 +528,12 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                         save_dest = os.path.join(self.server.serve_dir, decoded_url_path.lstrip('/'))
                         filename = os.path.basename(decoded_url_path) or "download"
                         
-                        if os.path.exists(save_dest) and os.path.getsize(save_dest) > 100:
-                            disk_size = os.path.getsize(save_dest)
+                        if os.path.exists(save_dest) and os.path.getsize(save_dest) > 0:
                             self.server.download_queue[u] = {
                                 "name": filename, 
                                 "url": u, 
                                 "status": "completed", 
-                                "size": format_size(disk_size)
+                                "size": format_size(os.path.getsize(save_dest))
                             }
                         else:
                             if u not in self.server.download_queue:
@@ -585,41 +619,39 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                 if is_text:
                     resp_data = response.read()
                     resp_data = self.rewrite_domain_references(resp_data, parsed_base)
-                    with open(cached_post_path, 'wb') as f:
+                    
+                    tmp_path = cached_post_path + f".{threading.get_ident()}.tmp"
+                    with open(tmp_path, 'wb') as f:
                         f.write(resp_data)
-                    file_size = len(resp_data)
+                    atomic_save(tmp_path, cached_post_path)
+                    
+                    served_data = inject_toolbar(resp_data) if 'text/html' in content_type else resp_data
                     
                     self.send_response(response.getcode())
                     self.patch_live_headers_for_browser(response)
                     self.send_header('Content-Type', content_type)
-                    self.send_header('Content-Length', str(file_size))
+                    self.send_header('Content-Length', str(len(served_data)))
                     self.end_headers()
                     try:
-                        self.wfile.write(resp_data)
+                        self.wfile.write(served_data)
                     except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
                         pass
                 else:
                     file_size = 0
-                    with open(cached_post_path, 'wb') as f:
+                    tmp_path = cached_post_path + f".{threading.get_ident()}.tmp"
+                    with open(tmp_path, 'wb') as f:
                         while True:
                             chunk = response.read(64 * 1024)
                             if not chunk:
                                 break
                             f.write(chunk)
                             file_size += len(chunk)
+                    atomic_save(tmp_path, cached_post_path)
 
                 with self.server.stats_lock:
                     self.server.download_count += 1
                     self.server.total_bytes += file_size
                     self.server.last_downloaded = f"POST {live_url}"
-
-                if getattr(self.server, 'verbose_logging', False):
-                    print(f"\n{CYAN}[+] Proxied POST ({format_size(file_size)}):{RESET} {live_url}", flush=True)
-                else:
-                    display_url = smart_truncate(f"POST {live_url}", max_len=70)
-                    size_str = format_size(self.server.total_bytes)
-                    sys.stdout.write(f"\r\033[K{CYAN}[i] Files:{RESET} {self.server.download_count} | {CYAN}Size:{RESET} {size_str} | {GREEN}Last:{RESET} {display_url}")
-                    sys.stdout.flush()
 
                 self.server.archive_needs_update = True
                 
@@ -627,8 +659,6 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                     self.serve_local_file(cached_post_path)
 
         except Exception as e:
-            if getattr(self.server, 'verbose_logging', False):
-                print(f"\n{RED}[-] Failed POST:{RESET} {live_url} - {e}", flush=True)
             try:
                 self.send_error(500, str(e))
             except Exception:
@@ -638,14 +668,14 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         if self.path == '/_ripweb/queue-status':
             with self.server.queue_lock:
                 for u, info in self.server.download_queue.items():
-                    decoded_url_path = unquote(urlparse(u).path)
-                    save_dest = os.path.join(self.server.serve_dir, decoded_url_path.lstrip('/'))
-                    if os.path.exists(save_dest) and os.path.getsize(save_dest) > 100:
-                        disk_size = os.path.getsize(save_dest)
-                        info["status"] = "completed"
-                        info["size"] = format_size(disk_size)
-                    else:
-                        if info["status"] == "completed":
+                    if info["status"] not in ["downloading", "failed"]:
+                        decoded_url_path = unquote(urlparse(u).path)
+                        save_dest = os.path.join(self.server.serve_dir, decoded_url_path.lstrip('/'))
+                        
+                        if os.path.exists(save_dest) and os.path.getsize(save_dest) > 0:
+                            info["status"] = "completed"
+                            info["size"] = format_size(os.path.getsize(save_dest))
+                        else:
                             info["status"] = "pending"
                             info["size"] = "Queued"
                 q_data = list(self.server.download_queue.values())
@@ -684,18 +714,25 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                         if not os.path.splitext(save_path)[1] and (b'<!DOCTYPE html>' in content_data[:100] or b'<html' in content_data[:100]):
                             save_path += '.html'
                             translated = save_path
-                        with open(save_path, 'wb') as f:
+                            
+                        tmp_path = save_path + f".{threading.get_ident()}.tmp"
+                        with open(tmp_path, 'wb') as f:
                             f.write(content_data)
+                        atomic_save(tmp_path, save_path)
+                        
                         file_size = len(content_data)
+                        served_data = inject_toolbar(content_data) if 'text/html' in content_type else content_data
                     else:
                         file_size = 0
-                        with open(save_path, 'wb') as f:
+                        tmp_path = save_path + f".{threading.get_ident()}.tmp"
+                        with open(tmp_path, 'wb') as f:
                             while True:
                                 chunk = response.read(64 * 1024)
                                 if not chunk:
                                     break
                                 f.write(chunk)
                                 file_size += len(chunk)
+                        atomic_save(tmp_path, save_path)
                         
                     with self.server.stats_lock:
                         self.server.download_count += 1
@@ -716,16 +753,14 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                         self.send_response(response.getcode())
                         self.patch_live_headers_for_browser(response)
                         self.send_header('Content-Type', content_type)
-                        self.send_header('Content-Length', str(len(content_data)))
+                        self.send_header('Content-Length', str(len(served_data)))
                         self.end_headers()
                         try:
-                            self.wfile.write(content_data)
+                            self.wfile.write(served_data)
                         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
                             pass
                         return
             except Exception as e:
-                if getattr(self.server, 'verbose_logging', False):
-                    print(f"\n{RED}[-] Failed to load:{RESET} {live_url} - {e}", flush=True)
                 try:
                     self.send_error(404, "File Not Found")
                 except Exception:
@@ -808,28 +843,50 @@ def main():
                     'Origin': f"{parsed_base.scheme}://{parsed_base.netloc}"
                 }
                 
+                opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx), urllib.request.HTTPRedirectHandler())
+
                 for target_url in target_urls:
                     with httpd.queue_lock:
                         decoded_url_path = unquote(urlparse(target_url).path)
                         filename = os.path.basename(decoded_url_path) or "download"
-                        httpd.download_queue[target_url] = {"name": filename, "url": target_url, "status": "downloading", "size": "Downloading..."}
+                        httpd.download_queue[target_url] = {"name": filename, "url": target_url, "status": "downloading", "size": "Initializing..."}
                     
                     try:
-                        decoded_url_path = unquote(urlparse(target_url).path)
-                        local_subpath = decoded_url_path.lstrip('/')
+                        parsed_u = urlparse(target_url)
+                        path_stripped = unquote(parsed_u.path).lstrip('/')
+                        
+                        if parsed_u.netloc.startswith("localhost") or parsed_u.netloc.startswith("127.0.0.1"):
+                            if path_stripped.startswith(parsed_base.netloc):
+                                real_url = f"{parsed_base.scheme}://{path_stripped}"
+                            else:
+                                real_url = urljoin(httpd.base_target_url, parsed_u.path)
+                        else:
+                            real_url = target_url
+
+                        local_subpath = path_stripped
                         save_dest = os.path.join(httpd.serve_dir, local_subpath)
                         os.makedirs(os.path.dirname(save_dest), exist_ok=True)
                         
-                        req = urllib.request.Request(target_url, headers=download_headers)
-                        with urllib.request.urlopen(req, timeout=300, context=ctx) as resp:
+                        req = urllib.request.Request(real_url, headers=download_headers)
+                        with opener.open(req, timeout=30) as resp:
                             downloaded_size = 0
-                            with open(save_dest, 'wb') as sf:
+                            tmp_dest = save_dest + f".{threading.get_ident()}.tmp"
+                            
+                            chunks = 0
+                            with open(tmp_dest, 'wb') as sf:
                                 while True:
                                     chk = resp.read(64 * 1024)
                                     if not chk:
                                         break
                                     sf.write(chk)
                                     downloaded_size += len(chk)
+                                    chunks += 1
+                                    
+                                    if chunks % 15 == 0:
+                                        with httpd.queue_lock:
+                                            httpd.download_queue[target_url]["size"] = format_size(downloaded_size)
+                                            
+                            atomic_save(tmp_dest, save_dest)
                                     
                             size_str = format_size(downloaded_size)
                             with httpd.queue_lock:
@@ -841,10 +898,20 @@ def main():
                                 httpd.total_bytes += downloaded_size
                                 httpd.last_downloaded = target_url
                             httpd.archive_needs_update = True
+                            
+                            if getattr(httpd, 'verbose_logging', False):
+                                print(f"\n{CYAN}[+] Queued DL ({size_str}):{RESET} {target_url}", flush=True)
+                            else:
+                                display_url = smart_truncate(target_url, max_len=70)
+                                sys.stdout.write(f"\r\033[K{CYAN}[i] Files:{RESET} {httpd.download_count} | {CYAN}Size:{RESET} {format_size(httpd.total_bytes)} | {GREEN}Last:{RESET} {display_url}")
+                                sys.stdout.flush()
+
                     except Exception as ex:
                         with httpd.queue_lock:
                             httpd.download_queue[target_url]["status"] = "failed"
                             httpd.download_queue[target_url]["size"] = "Error"
+                        if getattr(httpd, 'verbose_logging', False):
+                            print(f"\n{RED}[-] Queue Error:{RESET} {target_url} - {ex}", flush=True)
 
             httpd.process_download_queue = process_download_queue
             
