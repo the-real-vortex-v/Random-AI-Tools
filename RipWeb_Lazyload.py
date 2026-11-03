@@ -402,7 +402,10 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             if is_html:
                 with open(file_path, 'rb') as f:
                     data = f.read()
-                data = inject_toolbar(data)
+                
+                if getattr(self.server, 'enable_dm', True):
+                    data = inject_toolbar(data)
+                    
                 file_len = len(data)
                 self.send_response(200)
                 self.send_header('Content-Type', ctype)
@@ -620,12 +623,15 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                     resp_data = response.read()
                     resp_data = self.rewrite_domain_references(resp_data, parsed_base)
                     
-                    tmp_path = cached_post_path + f".{threading.get_ident()}.tmp"
-                    with open(tmp_path, 'wb') as f:
-                        f.write(resp_data)
-                    atomic_save(tmp_path, cached_post_path)
+                    if getattr(self.server, 'enable_lazy_cache', True):
+                        tmp_path = cached_post_path + f".{threading.get_ident()}.tmp"
+                        with open(tmp_path, 'wb') as f:
+                            f.write(resp_data)
+                        atomic_save(tmp_path, cached_post_path)
                     
-                    served_data = inject_toolbar(resp_data) if 'text/html' in content_type else resp_data
+                    served_data = resp_data
+                    if 'text/html' in content_type and getattr(self.server, 'enable_dm', True):
+                        served_data = inject_toolbar(resp_data)
                     
                     self.send_response(response.getcode())
                     self.patch_live_headers_for_browser(response)
@@ -637,23 +643,49 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                     except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
                         pass
                 else:
-                    file_size = 0
-                    tmp_path = cached_post_path + f".{threading.get_ident()}.tmp"
-                    with open(tmp_path, 'wb') as f:
+                    if getattr(self.server, 'enable_lazy_cache', True):
+                        file_size = 0
+                        tmp_path = cached_post_path + f".{threading.get_ident()}.tmp"
+                        with open(tmp_path, 'wb') as f:
+                            while True:
+                                chunk = response.read(64 * 1024)
+                                if not chunk: break
+                                f.write(chunk)
+                                file_size += len(chunk)
+                        atomic_save(tmp_path, cached_post_path)
+                    else:
+                        self.send_response(response.getcode())
+                        self.patch_live_headers_for_browser(response)
+                        self.send_header('Content-Type', content_type)
+                        content_len = response.headers.get('Content-Length')
+                        if content_len: self.send_header('Content-Length', content_len)
+                        self.end_headers()
+                        file_size = 0
                         while True:
                             chunk = response.read(64 * 1024)
-                            if not chunk:
-                                break
-                            f.write(chunk)
+                            if not chunk: break
+                            try: self.wfile.write(chunk)
+                            except: pass
                             file_size += len(chunk)
-                    atomic_save(tmp_path, cached_post_path)
 
                 with self.server.stats_lock:
                     self.server.download_count += 1
                     self.server.total_bytes += file_size
                     self.server.last_downloaded = f"POST {live_url}"
 
-                self.server.archive_needs_update = True
+                if getattr(self.server, 'verbose_logging', False):
+                    print(f"\n{CYAN}[+] Proxied POST ({format_size(file_size)}):{RESET} {live_url}", flush=True)
+                else:
+                    display_url = smart_truncate(f"POST {live_url}", max_len=70)
+                    size_str = format_size(self.server.total_bytes)
+                    sys.stdout.write(f"\r\033[K{CYAN}[i] Files:{RESET} {self.server.download_count} | {CYAN}Size:{RESET} {size_str} | {GREEN}Last:{RESET} {display_url}")
+                    sys.stdout.flush()
+
+                if getattr(self.server, 'enable_lazy_cache', True):
+                    self.server.archive_needs_update = True
+                
+                if not getattr(self.server, 'enable_lazy_cache', True) and not is_text:
+                    return
                 
                 if not is_text:
                     self.serve_local_file(cached_post_path)
@@ -715,24 +747,44 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                             save_path += '.html'
                             translated = save_path
                             
-                        tmp_path = save_path + f".{threading.get_ident()}.tmp"
-                        with open(tmp_path, 'wb') as f:
-                            f.write(content_data)
-                        atomic_save(tmp_path, save_path)
+                        if getattr(self.server, 'enable_lazy_cache', True):
+                            tmp_path = save_path + f".{threading.get_ident()}.tmp"
+                            with open(tmp_path, 'wb') as f:
+                                f.write(content_data)
+                            atomic_save(tmp_path, save_path)
                         
                         file_size = len(content_data)
-                        served_data = inject_toolbar(content_data) if 'text/html' in content_type else content_data
+                        served_data = content_data
+                        
+                        if 'text/html' in content_type and getattr(self.server, 'enable_dm', True):
+                            served_data = inject_toolbar(content_data)
                     else:
-                        file_size = 0
-                        tmp_path = save_path + f".{threading.get_ident()}.tmp"
-                        with open(tmp_path, 'wb') as f:
+                        if getattr(self.server, 'enable_lazy_cache', True):
+                            file_size = 0
+                            tmp_path = save_path + f".{threading.get_ident()}.tmp"
+                            with open(tmp_path, 'wb') as f:
+                                while True:
+                                    chunk = response.read(64 * 1024)
+                                    if not chunk:
+                                        break
+                                    f.write(chunk)
+                                    file_size += len(chunk)
+                            atomic_save(tmp_path, save_path)
+                        else:
+                            self.send_response(response.getcode())
+                            self.patch_live_headers_for_browser(response)
+                            self.send_header('Content-Type', content_type)
+                            content_len = response.headers.get('Content-Length')
+                            if content_len: self.send_header('Content-Length', content_len)
+                            self.end_headers()
+                            
+                            file_size = 0
                             while True:
                                 chunk = response.read(64 * 1024)
-                                if not chunk:
-                                    break
-                                f.write(chunk)
+                                if not chunk: break
+                                try: self.wfile.write(chunk)
+                                except: pass
                                 file_size += len(chunk)
-                        atomic_save(tmp_path, save_path)
                         
                     with self.server.stats_lock:
                         self.server.download_count += 1
@@ -747,7 +799,11 @@ class SmartHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                         sys.stdout.write(f"\r\033[K{CYAN}[i] Files:{RESET} {self.server.download_count} | {CYAN}Size:{RESET} {size_str} | {GREEN}Last:{RESET} {display_url}")
                         sys.stdout.flush()
 
-                    self.server.archive_needs_update = True
+                    if getattr(self.server, 'enable_lazy_cache', True):
+                        self.server.archive_needs_update = True
+                        
+                    if not getattr(self.server, 'enable_lazy_cache', True) and not is_text:
+                        return
                     
                     if is_text:
                         self.send_response(response.getcode())
@@ -783,6 +839,8 @@ def main():
     parser.add_argument("-k", "--keep", action="store_true", help="Keep temporary cache files after exit")
     parser.add_argument("-s", "--skip-compression", action="store_true", help="Skip archive compression and preserve loose temp files")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose HTTP logging")
+    parser.add_argument("-DM", "--download-manager", nargs="?", const="on", default="on", choices=["on", "off"], help="Enable/disable Download Manager UI (default: on)")
+    parser.add_argument("-L", "--lazy-cache", nargs="?", const="on", default="on", choices=["on", "off"], help="Enable/disable lazy caching to disk (default: on)")
 
     args = parser.parse_args()
 
@@ -803,6 +861,8 @@ def main():
         serve_dir = tempfile.mkdtemp(prefix="ripweb_")
 
     print(f"{CYAN}Cache Directory:{RESET} {serve_dir}")
+    print(f"{CYAN}Download Manager UI:{RESET} {GREEN if args.download_manager == 'on' else RED}{args.download_manager.upper()}{RESET}")
+    print(f"{CYAN}Lazy Caching (Disk Write):{RESET} {GREEN if args.lazy_cache == 'on' else RED}{args.lazy_cache.upper()}{RESET}")
 
     original_cwd = os.getcwd()
     try:
@@ -821,6 +881,8 @@ def main():
             httpd.base_target_url = args.target
             httpd.archive_needs_update = False
             httpd.verbose_logging = args.verbose
+            httpd.enable_dm = (args.download_manager == "on")
+            httpd.enable_lazy_cache = (args.lazy_cache == "on")
             httpd.download_count = 0
             httpd.total_bytes = 0
             httpd.last_downloaded = "None"
