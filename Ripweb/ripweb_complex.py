@@ -1542,15 +1542,19 @@ def main():
                 opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx), urllib.request.HTTPRedirectHandler())
 
                 for target_url in target_urls:
-                    tid = threading.get_ident()
-                    start_t = time.time()
-
+                    # Prevent duplicate concurrent downloads for the same URL
                     with httpd.queue_lock:
+                        if target_url in httpd.download_queue and httpd.download_queue[target_url]["status"] == "downloading":
+                            continue
                         decoded_url_path = unquote(urlparse(target_url).path)
                         filename = os.path.basename(decoded_url_path) or "download"
                         httpd.download_queue[target_url] = {"name": filename, "url": target_url, "status": "downloading", "size": "Initializing..."}
+
+                    tid = threading.get_ident()
+                    start_t = time.time()
                     
                     try:
+                        # ... (rest of the download logic remains unchanged)
                         parsed_u = urlparse(target_url)
                         path_stripped = unquote(parsed_u.path).lstrip('/')
                         
