@@ -1,89 +1,137 @@
-# Some tools made with AI "Vibe" coding. It's all about the "vibe" you know? They work and they work good enough. As long as it's a useful tool then who cares if it's working AI Slop?
+# The most complete project here so far is Ripweb. I will discuss others as they are finished or nearly finished.
 
-# RipWeb Enterprise Archiver & Live Proxy
+[ripweb_enterprise_documentation.md](https://github.com/user-attachments/files/34450556/ripweb_enterprise_documentation.md)
+# RipWeb Enterprise 🌐📦
 
-**RipWeb Enterprise** (`RipWeb_complex.py`) is an offline website archiver, proxy server, and web download manager. It acts as an on-the-fly local caching proxy while automatically stripping Content Security Policies (CSP) and injecting an in-browser enterprise download manager to capture media, documents, and assets during regular browsing.
+**RipWeb Enterprise** is an advanced, self-contained, single-file multi-site namespace gateway, live scraper proxy, and offline packaging suite written in pure Python (utilizing only standard library modules with zero external dependencies). 
 
----
-
-## 1. Core Capabilities
-
-* **On-The-Fly Web Archiving:** Proxies HTTP/HTTPS traffic through a local port, serving existing files from cache while transparently downloading and caching new assets.
-* **In-Browser Toolbar Injection:** Automatically injects a fixed-position DOM toolbar into all served HTML documents, providing real-time controls for link scanning, queued downloading, and state locking.
-* **Auto-Queueing & Intersection Observer:** Employs dynamic viewport detection (`IntersectionObserver`) to scan and queue media files as they scroll into view.
-* **Automatic CSP & Security Mitigation:** Strips restrictive HTTP CSP headers, frame locks, and cross-origin security rules to allow uninhibited inline script execution and asset fetching.
-* **HTTP Range & Media Support:** Full support for byte-range HTTP standard requests (`206 Partial Content`), allowing seekable audio/video streaming directly from the local archive.
-* **Portable Offline Exporters:**
-  * **Mode 1 (Directory Index):** Generates a static HTML sidebar browser for reviewing local files offline.
-  * **Mode 2 (2-File JS-Jar Loader):** Packages the entire website into a compressed `.zip` or `.jar` archive and pairs it with a client-side JavaScript loader for pure browser-native RAM unzipping.
+Whether you are archiving complex websites for offline research, preserving digital artifacts, or testing web application assets in a sandboxed local environment, RipWeb provides a seamless bridge between live web traffic and fully portable, standalone offline archives.
 
 ---
 
-## 2. Command Line Interface (CLI) & Examples
+## 🚀 What Does RipWeb Enterprise Do?
 
-### Usage Syntax
+Standard web scrapers often break because modern websites rely heavily on dynamic JavaScript, absolute CDN links, cross-domain cookie policies, and asynchronous asset loading. RipWeb operates as a **transparent man-in-the-middle proxy and namespace gateway**. 
+
+When you browse the web through RipWeb:
+1. **It intercepts and normalizes traffic** dynamically rewriting all asset links (`href`, `src`, `srcset`, `action`) so they route cleanly through local proxy namespaces (`/domain.com/path`).
+2. **It builds a clean local cache directory structure** that mirrors exact domain hierarchies on your disk.
+3. **It features a background asset download manager** that automatically crawls and queues linked resources (images, stylesheets, scripts, media) so your local mirror is complete.
+4. **It bundles everything into a zero-setup standalone offline package** complete with a native WebAssembly/JavaScript ZIP parser (`_Loader.html`) that can render complex websites entirely out of a single `.zip` file without needing an active server or internet connection.
+
+---
+
+## 💎 Key Features & Capabilities
+
+* **Multi-Site Namespace Gateway:** Seamlessly switch between multiple domains and subdomains under a single proxy port (`http://localhost:1337/domain1.com/` and `http://localhost:1337/domain2.org/`).
+* **Standalone Offline VFS Loader:** Generates a lightweight `_Loader.html` sidecar that unpacks your `.zip` archive entirely in your browser's memory using native `DecompressionStream` APIs and constructs secure virtual `blob:` URLs.
+* **Three Unified User Interfaces:**
+  1. *The Terminal Text Console* (Real-time ANSI dashboard with single-keypress hotkeys).
+  2. *The Web Management Console* (Browser-based control center for project management and exports).
+  3. *The Web Downloader Toolbar* (Floating widget injected into browsed pages for real-time asset scanning and bulk downloading).
+* **Cross-Domain Interstitial Guard:** Intercepts external link clicks and presents an intuitive decision page allowing you to record the new domain to your current project or spin up an isolated session.
+* **Isolated `.export` Folders:** Neatly packages each export into a dedicated `{session_id}.export` directory containing both the `.zip` archive and the offline loader.
+* **Flexible Compression Options:** Choose between standard Deflate compression (smaller file size) or Store compression (uncompressed, instant export) when packaging archives.
+* **Safety Lock & Cleanup Protection:** Lock projects into offline read-only mode to prevent accidental overwrites, and protect unexported sessions with interactive warning guards before deletion.
+
+---
+
+## 📦 Installation & System Requirements
+
+RipWeb Enterprise has **zero external Python dependencies**. It requires:
+* **Python 3.8 or higher** (Python 3.10+ recommended).
+* A modern web browser (Chrome, Firefox, Edge, Waterfox, Safari) for viewing and running the offline loader.
+
+Simply download `ripweb_enterprise_active_connections.py` (or your customized script filename) and place it in your working directory.
+
+---
+
+## 🕹️ Command Line Options & Quick Start
+
+You can launch RipWeb directly from your terminal. If you provide a target URL on startup, it will initialize the archiving session immediately.
+
+### Basic Command
 ```bash
-python RipWeb_complex.py <TARGET_URL> [options]
-
-Flag,Full Name,Description,Default
--p,--port,Local port number to bind the HTTP proxy server.,8000
--a,--archive,Target path for compressed output archive (.zip or .7z).,Auto domain name
--t,--temp,Directory path for the uncompressed local cache directory.,System Temp
--s,--skip-compression,Keeps cache as an uncompressed folder on exit without zipping.,Disabled
--k,--keep,Preserves local cache directory on disk after exiting.,Disabled
--v,--verbose,Output verbose HTTP request and response stream lines.,Disabled
--dm,--download-manager,Toggles injected in-browser toolbar UI (on or off).,on
--l,--lazy-cache,Toggles writing proxied web assets directly to disk (on or off).,on
--c,--create-portable,Generates portable offline package without starting server (directory or jar).,None
+python ripweb_enterprise_active_connections.py https://www.wikipedia.org
 ```
 
-### Execution Examples
-Example 1: Standard Mirroring with Custom Directory Cache
-Start archiving a target site on port 1337 and keep the uncompressed folder on drive F:
-
-```Bash:
-python RipWeb_complex.py [https://archive.org/download/the-bill-complete-series-1-to-26/](https://archive.org/download/the-bill-complete-series-1-to-26/) -p 1337 -t F:\web\Internet_Archive -s
-```
-Example 2: Target Custom .7z Archive Output
-Cache files to a 7-Zip file named media_archive.7z:
-```
-python RipWeb_complex.py [https://example.com/gallery](https://example.com/gallery) -a media_archive.7z
-```
-Example 3: Offline Portable Package Generation
-Build a 2-file JS-Jar client-side browser loader from an existing archive:
-```
-python RipWeb_complex.py -a media_archive.zip -c jar
+### Advanced Command Example
+```bash
+python ripweb_enterprise_active_connections.py -p 1337 -w F:\web\downloads
 ```
 
-## 3. Console & Injected UI Controls
-```
-Terminal Dashboard Hotkeys (Press Key + Enter)
-L / l (Lock): Freezes local site cache. Rejects any live requests to remote servers.
-U / u (Unlock): Unfreezes local site cache, re-enabling live proxying.
-E / e (Export): Triggers the offline portable wizard.
-H / h (Help): Opens full CLI documentation.
-Q / q (Quit): Gracefully stops the HTTP server, compresses the cache into the specified archive, and exits.
-```
+### Complete CLI Options Reference
+| Flag / Option | Description | Default |
+| :--- | :--- | :--- |
+| `url` (positional) | Optional target website URL to start archiving immediately | `None` |
+| `-u`, `--url URL` | Target website URL to start archiving session | `None` |
+| `-p`, `--port PORT` | Specify the local gateway proxy port | `8000` |
+| `-w`, `-t`, `--workspace DIR` | Directory where session caches and `.export` folders are stored | `./ripweb_workspace` |
+| `--no-dashboard` | Disables the root Web Management Console dashboard | `False` |
+| `-v`, `--verbose` | Enables verbose HTTP network debugging logs in the terminal | `False` |
+| `-h`, `-?`, `--help` | Displays the rich terminal help manual | `False` |
 
-### Browser Web Toolbar Buttons:
-```
-Lazy-Queue: Toggles automatic links detection via viewport scrolling.
+---
 
-Auto-Download: Instantly begins downloading matched media items as soon as they enter the queue.
+## 🖥️ The Three User Interfaces Explained
 
-Lock Website: Toggles site lock state from within the browser window.
+### 1. The Web Management Console (`http://localhost:<port>/`)
+When you open your browser and navigate to `http://localhost:1337/`, you are greeted by the Enterprise Control Center. 
 
-Scan Page: Manual DOM parse for media files (.mp4, .zip, .pdf, .png, etc.).
+* **Start New Project:** Enter any URL to instantly spin up a new namespace session.
+* **Active Workspace Projects Table:** Displays all active sessions, primary domains, recorded linked CDNs, total cached file counts, and storage sizes.
+* **Action Buttons:**
+  * **Browse:** Opens the live proxy view of the primary site.
+  * **Lock / Unlock:** Toggles offline read-only mode (freezes cache so no new live requests are made).
+  * **Export:** Opens compression choices and builds the standalone `.export` package.
+  * **Cleanup / Delete:** Purges the disk cache with built-in safety guards preventing accidental deletion of unexported sessions.
+  * **Try Loader (Purple Button):** Unlocks once exported, allowing you to test the offline HTML loader directly in a new tab.
 
-DL Selected: Commences downloading checked items in the toolbar drawer.
+---
 
-Resync Sizes: Sends HEAD requests to compare remote vs local byte lengths for verification.
+### 2. The Injected Web Downloader Toolbar
+When browsing any website through the RipWeb proxy, a floating toolbar (`RipWeb Downloader`) appears in the bottom-right corner of the page.
 
-Clear Finished: Purges validated downloads from the queue drawer list.
-```
-## 4. Technical Limitations
-Single-Origin Proxying: RipWeb translates URLs tied to the target host domain. Multi-domain cross-origin links (e.g., media hosted across external third-party CDNs or S3 buckets) will bypass the local domain mapping unless rewritten explicitly.
+* **Live Status Indicator:** Shows whether the current session is `ACTIVE` (live capturing) or `LOCKED` (offline testing). Clicking the lock button toggles the state instantly.
+* **Scan Page:** Automatically traverses the current DOM, harvesting all images, scripts, stylesheets, audio, video, and anchor links, registering them into the background download queue.
+* **Interactive File Queue Box:** Displays captured assets with color-coded status icons (`⏳ Pending`, `🔄 Downloading`, `✅ Finished`, `❌ Failed`).
+* **Checkboxes & Filters:** Check/uncheck specific assets or use the real-time name filter input to narrow down files before downloading.
+* **DL Selected / Invert / Clear:** Queue selected assets for background downloading, invert your selection, or wipe completed items from the list.
 
-Dynamic SPA / WebSockets: Heavy Single Page Applications relying on WebSocket streams, WebRTC, or runtime WebAssembly APIs may require manual interaction to trigger HTTP asset requests.
+---
 
-HTTP Authentication & CAPTCHAs: RipWeb does not automatically bypass Cloudflare CAPTCHAs or complex OAuth authentication flows unless pass-through cookies are already established in the client browser session.
+### 3. The Terminal Text Console
+If verbose mode is disabled, RipWeb runs a sleek, zero-flicker ANSI terminal dashboard that updates in real-time.
+
+* **Health Telemetry:** Monitors the connection status between your browser, the local proxy, and remote target servers.
+* **Active Connections & Transfer Speeds:** Live progress breakdown showing files currently downloading, transfer speeds, and file sizes.
+* **Download History:** Scrollable log of the last 10 completed or failed file transfers.
+* **Instant Single-Keypress Hotkeys (No Enter key required!):**
+  * `[B]`rowse active session in default browser.
+  * `[O]`pen Web Management Console.
+  * `[E]`xport session package wizard.
+  * `[L]`ock / Unlock session cache mode.
+  * `[C]`lear finished queue items.
+  * `[P]`ause or resume the background downloader.
+  * `[H]`elp documentation manual.
+  * `[R]`edraw/clear screen to fix terminal resize artifacts.
+  * `[V]`erbose mode toggle.
+  * `[Q]`uit server cleanly.
+
+---
+
+## 📦 Exporting and Offline Viewing Workflow
+
+1. **Capture:** Browse your target website using RipWeb, click **Scan Page**, and use **DL Selected** to cache all necessary assets.
+2. **Export:** Go to the Web Management Console (`http://localhost:1337/`), select your compression preference (`ZIP Compressed` or `ZIP Store`), and click **Export**.
+3. **Storage:** RipWeb creates a folder named `{session_id}.export/` in your workspace containing:
+   * `{session_id}.zip` (The complete compressed archive of all captured domains and assets).
+   * `_Loader.html` (The standalone offline virtual filesystem viewer).
+4. **Test:** Click the purple **Try Loader** button on the dashboard.
+5. **Offline Share:** You can zip or copy the `{session_id}.export` folder anywhere, hand it to anyone, and they can double-click `_Loader.html` to browse the website completely offline!
+
+---
+
+## 🛡️ License & Architecture Notes
+
+RipWeb Enterprise is designed for local archiving, educational research, and offline accessibility preservation. Always ensure you have permission or adhere to robots/terms of service when archiving public web domains.
